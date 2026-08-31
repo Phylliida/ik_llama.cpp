@@ -156,7 +156,7 @@ int main(int argc, char ** argv) {
     console::init(params.simple_io, params.use_color);
     atexit([]() { console::cleanup(); });
 
-    if (params.logits_all) {
+    if (params.logits_all && params.expert_trace.empty()) {
         printf("\n************\n");
         printf("%s: please use the 'perplexity' tool for perplexity calculations\n", __func__);
         printf("************\n\n");

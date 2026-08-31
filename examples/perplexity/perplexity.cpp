@@ -2133,6 +2133,16 @@ int main(int argc, char ** argv) {
         return 1;
     }
 
+    if (!params.expert_trace.empty()) {
+        if (!llama_expert_trace_start(ctx, params.expert_trace.c_str())) {
+            fprintf(stderr, "%s: error: failed to open expert trace file '%s'\n", __func__, params.expert_trace.c_str());
+            llama_free(ctx);
+            llama_free_model(model);
+            llama_backend_free();
+            return 1;
+        }
+    }
+
     const int n_ctx_train = llama_n_ctx_train(model);
 
     if (params.n_ctx > n_ctx_train) {

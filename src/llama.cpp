@@ -6404,12 +6404,16 @@ static void llama_expert_trace_record(
     };
 
     struct moe_found {
-        int32_t      il   = -1;
-        ggml_tensor *topk = nullptr;
-        ggml_tensor *wgt  = nullptr;
+        int32_t      il    = -1;
+        ggml_tensor *topk  = nullptr;
+        ggml_tensor *wgt   = nullptr;
         int          wgt_prio = -1;
+        ggml_tensor *probs = nullptr; // verification only: biased selection probs preferred
     };
     std::map<int32_t, moe_found> moe_map;
+
+    const bool exp_verify = getenv("IK_EXPVERIFY") != nullptr;
+    int n_topk_nodes = 0, n_probs_nodes = 0, n_wgt_nodes = 0;
 
     for (int i = 0; i < gf->n_nodes; i++) {
         ggml_tensor * node = gf->nodes[i];
@@ -6418,6 +6422,23 @@ static void llama_expert_trace_record(
             auto & e = moe_map[atoi(name + 13)];
             e.il   = atoi(name + 13);
             e.topk = node;
+            n_topk_nodes++;
+            continue;
+        }
+        if (strncmp(name, "ffn_moe_probs_biased-", 21) == 0) {
+            auto & e  = moe_map[atoi(name + 21)];
+            e.il    = atoi(name + 21);
+            e.probs = node; // selection probs (biased) take priority
+            n_probs_nodes++;
+            continue;
+        }
+        if (strncmp(name, "ffn_moe_probs-", 14) == 0) {
+            auto & e = moe_map[atoi(name + 14)];
+            e.il = atoi(name + 14);
+            if (!e.probs) {
+                e.probs = node;
+            }
+            n_probs_nodes++;
             continue;
         }
         for (const auto & [prefix, prio] : wgt_prefixes) {
@@ -6427,6 +6448,7 @@ static void llama_expert_trace_record(
                 e.il       = atoi(name + plen);
                 e.wgt      = node;
                 e.wgt_prio = prio;
+                n_wgt_nodes++;
                 break;
             }
         }
@@ -6454,22 +6476,21 @@ static void llama_expert_trace_record(
     // The last layer(s) may only be computed for the tokens that need logits
     // (n_outputs optimization). Map each ubatch token to its column in the
     // router output tensors: full [k, n_tokens] tensors use the token index
-    // directly, trimmed [k, n_outputs] tensors only cover the logits-flagged
-    // tokens in order; tokens that were never routed get the -1 sentinel.
+    // directly, trimmed [k, n_outputs] tensors only cover the output tokens;
+    // tokens that were never routed get the -1 sentinel.
+    // Output-row convention mirrors llama_set_inputs: with a logits array the
+    // output rows are the logits-flagged tokens in order; without one only the
+    // very last token's row is kept.
     std::vector<int32_t> col_of_token(n_tokens, -1);
-    {
+    if (ubatch.logits) {
         int32_t col = 0;
-        if (ubatch.logits) {
-            for (int32_t t = 0; t < n_tokens; t++) {
-                if (ubatch.logits[t]) {
-                    col_of_token[t] = col++;
-                }
-            }
-        } else {
-            for (int32_t t = 0; t < n_tokens; t++) {
-                col_of_token[t] = t;
+        for (int32_t t = 0; t < n_tokens; t++) {
+            if (ubatch.logits[t]) {
+                col_of_token[t] = col++;
             }
         }
+    } else {
+        col_of_token[n_tokens - 1] = 0; // only the last output row is kept
     }
 
     if (!tracer->header_written) {
@@ -6500,20 +6521,111 @@ static void llama_expert_trace_record(
     for (int32_t l = 0; l < n_layers; l++) {
         const auto & e = moe[l];
         const size_t n_vals = (size_t) e.topk->ne[0] * e.topk->ne[1];
-        const bool width_ok = e.topk->ne[1] == n_tokens ||
-                             (ubatch.logits && (int64_t) e.topk->ne[1] == std::count_if(col_of_token.begin(), col_of_token.end(), [](int32_t c) { return c >= 0; }));
+        const int32_t n_out_cols = (int32_t) std::count_if(col_of_token.begin(), col_of_token.end(), [](int32_t c) { return c >= 0; });
+        const bool width_ok = e.topk->ne[1] == n_tokens || (int64_t) e.topk->ne[1] == n_out_cols;
         if (e.topk->type != GGML_TYPE_I32 || !width_ok || e.topk->ne[0] != tracer->layers[l].n_topk) {
             continue; // unexpected shape/type: leave this layer as -1 sentinel
         }
 
+        // read back honoring the actual row pitch: ggml tensors are NOT
+        // guaranteed contiguous (observed: Vulkan top_k output [8, n] has
+        // nb[1] = 512 while n_topk*4 = 32). A flat read of such a tensor
+        // returns mostly pitch-padding garbage — read per column instead.
+        const int32_t n_topk_l = tracer->layers[l].n_topk;
         ids_all[l].resize(n_vals);
-        ggml_backend_tensor_get(e.topk, ids_all[l].data(), 0, n_vals * sizeof(int32_t));
+        {
+            const size_t col_bytes = (size_t) n_topk_l * sizeof(int32_t);
+            const size_t pitch     = e.topk->ne[0] == n_topk_l ? e.topk->nb[1] : e.topk->nb[2]; // [k,n] or [1,k,n]
+            if (pitch == col_bytes || n_vals == (size_t) n_topk_l) {
+                ggml_backend_tensor_get(e.topk, ids_all[l].data(), 0, n_vals * sizeof(int32_t));
+            } else {
+                for (size_t c = 0; c + (size_t) n_topk_l <= n_vals; c += (size_t) n_topk_l) {
+                    ggml_backend_tensor_get(e.topk, ids_all[l].data() + c, (c / n_topk_l) * pitch, col_bytes);
+                }
+            }
+        }
         ids_ptrs[l] = ids_all[l].data();
 
         if (e.wgt && e.wgt->type == GGML_TYPE_F32 && (size_t) ggml_nelements(e.wgt) == n_vals) {
             wgt_all[l].resize(n_vals);
-            ggml_backend_tensor_get(e.wgt, wgt_all[l].data(), 0, n_vals * sizeof(float));
+            const size_t col_bytes = (size_t) n_topk_l * sizeof(float);
+            const size_t pitch     = e.wgt->ne[0] == n_topk_l ? e.wgt->nb[1] : e.wgt->nb[2]; // [k,n] or [1,k,n]
+            if (pitch == col_bytes || n_vals == (size_t) n_topk_l) {
+                ggml_backend_tensor_get(e.wgt, wgt_all[l].data(), 0, n_vals * sizeof(float));
+            } else {
+                for (size_t c = 0; c + (size_t) n_topk_l <= n_vals; c += (size_t) n_topk_l) {
+                    ggml_backend_tensor_get(e.wgt, wgt_all[l].data() + c, (c / n_topk_l) * pitch, col_bytes);
+                }
+            }
             wgt_ptrs[l] = wgt_all[l].data();
+        }
+    }
+
+    // optional verification: recompute top-k on CPU from the router probs
+    // tensor and compare with the GPU-produced ids we are about to record
+    // (IK_EXPVERIFY=1; validates the readback layout / tensor identity)
+    if (exp_verify) {
+        static bool printed_counts = false;
+        if (!printed_counts) {
+            printed_counts = true;
+            fprintf(stderr, "EXPVERIFY node counts: topk=%d probs=%d wgt=%d (MoE layers=%zu)\n",
+                    n_topk_nodes, n_probs_nodes, n_wgt_nodes, moe.size());
+        }
+        for (int32_t l = 0; l < n_layers; l++) {
+            const auto & e = moe[l];
+            if (!e.topk || !e.probs || e.probs->type != GGML_TYPE_F32 || !ids_ptrs[l]) {
+                continue;
+            }
+            const int32_t n_expert = (int32_t) e.probs->ne[0];
+            const int32_t n_cols   = (int32_t) e.probs->ne[1];
+            const int32_t n_topk   = tracer->layers[l].n_topk;
+            if (l == 0) {
+                fprintf(stderr, "EXPVERIFY l0 shapes: topk ne %lld x %lld nb %zu %zu | probs ne %lld x %lld nb %zu %zu\n",
+                        (long long) e.topk->ne[0], (long long) e.topk->ne[1], e.topk->nb[0], e.topk->nb[1],
+                        (long long) e.probs->ne[0], (long long) e.probs->ne[1], e.probs->nb[0], e.probs->nb[1]);
+            }
+            if (n_cols != (int32_t) e.topk->ne[1] || n_expert <= 0) {
+                fprintf(stderr, "EXPVERIFY layer %2d: width mismatch probs [%d x %d] vs topk [%d x %d]\n",
+                        e.il, n_expert, n_cols, (int) e.topk->ne[0], (int) e.topk->ne[1]);
+                continue;
+            }
+            // flat readback (assumes row stride == n_expert*4)
+            std::vector<float> probs((size_t) n_expert * n_cols);
+            ggml_backend_tensor_get(e.probs, probs.data(), 0, probs.size() * sizeof(float));
+            // stride-aware readback (row c at byte offset c*nb[1])
+            std::vector<float> probs_sa((size_t) n_expert * n_cols);
+            for (int32_t c = 0; c < n_cols; c++) {
+                ggml_backend_tensor_get(e.probs, probs_sa.data() + (size_t) c * n_expert,
+                                        (size_t) c * e.probs->nb[1], (size_t) n_expert * sizeof(float));
+            }
+            double ov_sum = 0, ov_sum_sa = 0;
+            int    exact  = 0, exact_sa = 0;
+            for (int32_t c = 0; c < n_cols; c++) {
+                const int32_t * got = ids_ptrs[l] + (size_t) c * n_topk;
+                for (int pass = 0; pass < 2; pass++) {
+                    const float * colp = (pass == 0 ? probs : probs_sa).data() + (size_t) c * n_expert;
+                    std::vector<int32_t> ord(n_expert);
+                    std::iota(ord.begin(), ord.end(), 0);
+                    std::partial_sort(ord.begin(), ord.begin() + n_topk, ord.end(),
+                            [&](int32_t a, int32_t b) { return colp[a] > colp[b]; });
+                    int32_t ov = 0;
+                    for (int32_t k = 0; k < n_topk; k++) {
+                        for (int32_t j = 0; j < n_topk; j++) {
+                            ov += got[j] == ord[k];
+                        }
+                    }
+                    if (pass == 0) { ov_sum += ov; exact += ov == n_topk; }
+                    else           { ov_sum_sa += ov; exact_sa += ov == n_topk; }
+                }
+                if (l == 0 && c == 0) {
+                    fprintf(stderr, "EXPVERIFY l0 c0: gpu ids");
+                    for (int32_t k = 0; k < n_topk; k++) fprintf(stderr, " %d", got[k]);
+                    fprintf(stderr, "\n");
+                }
+            }
+            fprintf(stderr, "EXPVERIFY layer %2d: cols %d, exact-set %d, mean overlap %.3f/%d | stride-aware exact %d, overlap %.3f\n",
+                    e.il, n_cols, exact, n_cols ? ov_sum / n_cols : 0.0, n_topk,
+                    exact_sa, n_cols ? ov_sum_sa / n_cols : 0.0);
         }
     }
 
