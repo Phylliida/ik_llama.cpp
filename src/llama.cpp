@@ -6437,12 +6437,45 @@ struct llama_context::llama_expert_tracer {
     };
     std::vector<layer_info> layers;
 
+    // IK_EXPVERIFY: compute-time snapshots of the router probs tensors.
+    // Post-hoc readback is unreliable: ggml_top_k's internal sort REUSES the
+    // biased probs buffer in place, and arena reuse can clobber the plain one,
+    // so we copy the tensors out via the sched eval callback as they are computed.
+    std::map<std::string, std::vector<float>> snap;
+
     ~llama_expert_tracer() {
         if (fp) {
             fclose(fp);
         }
     }
 };
+
+static int llama_expert_trace_snap_cb(ggml_tensor * t, bool ask, void * user_data) {
+    const char * n = t->name;
+    bool match = false;
+    if (strncmp(n, "ffn_moe_probs_biased-", 21) == 0) {
+        const char * p = n + 21;
+        while (*p >= '0' && *p <= '9') p++;
+        match = *p == '\0';
+    } else if (strncmp(n, "ffn_moe_probs-", 14) == 0) {
+        const char * p = n + 14;
+        while (*p >= '0' && *p <= '9') p++;
+        match = *p == '\0';
+    }
+    if (ask) {
+        return match && t->type == GGML_TYPE_F32;
+    }
+    if (match && t->type == GGML_TYPE_F32) {
+        auto * snap = (std::map<std::string, std::vector<float>> *) user_data;
+        const int64_t nx = t->ne[0], ny = t->ne[1];
+        std::vector<float> buf((size_t) nx * ny);
+        for (int64_t c = 0; c < ny; c++) {
+            ggml_backend_tensor_get(t, buf.data() + (size_t) c * nx, (size_t) c * t->nb[1], (size_t) nx * sizeof(float));
+        }
+        (*snap)[n] = std::move(buf);
+    }
+    return true;
+}
 
 // Mark the router output tensors as graph outputs so that the ggml allocator
 // keeps their data alive until the end of the graph compute (intermediate
@@ -6530,15 +6563,19 @@ static void llama_expert_trace_record(
             continue;
         }
         if (strncmp(name, "ffn_moe_probs_biased-", 21) == 0) {
-            auto & e  = moe_map[atoi(name + 21)];
-            e.il    = atoi(name + 21);
-            e.probs = node; // selection probs (biased) take priority
-            n_probs_nodes++;
+            // NOTE: the biased selection tensor dies right after top_k and its
+            // arena memory is reused, so post-hoc readback is unreliable — the
+            // plain probs (consumed later by get_rows for the weights) survives,
+            // and the bias is a persistent model tensor; verify uses plain+bias.
             continue;
         }
         if (strncmp(name, "ffn_moe_probs-", 14) == 0) {
-            auto & e = moe_map[atoi(name + 14)];
-            e.il = atoi(name + 14);
+            const char * p = name + 14;
+            int il = atoi(p);
+            while (*p >= '0' && *p <= '9') p++;
+            if (*p != '\0' || node->type != GGML_TYPE_F32) continue; // reject companions like "... (sort)"
+            auto & e = moe_map[il];
+            e.il = il;
             if (!e.probs) {
                 e.probs = node;
             }
@@ -6677,60 +6714,64 @@ static void llama_expert_trace_record(
         }
         for (int32_t l = 0; l < n_layers; l++) {
             const auto & e = moe[l];
-            if (!e.topk || !e.probs || e.probs->type != GGML_TYPE_F32 || !ids_ptrs[l]) {
+            if (!e.topk || !ids_ptrs[l]) {
                 continue;
             }
-            const int32_t n_expert = (int32_t) e.probs->ne[0];
-            const int32_t n_cols   = (int32_t) e.probs->ne[1];
+            const int32_t n_expert = tracer->layers[l].n_expert;
             const int32_t n_topk   = tracer->layers[l].n_topk;
-            if (l == 0) {
-                fprintf(stderr, "EXPVERIFY l0 shapes: topk ne %lld x %lld nb %zu %zu | probs ne %lld x %lld nb %zu %zu\n",
-                        (long long) e.topk->ne[0], (long long) e.topk->ne[1], e.topk->nb[0], e.topk->nb[1],
-                        (long long) e.probs->ne[0], (long long) e.probs->ne[1], e.probs->nb[0], e.probs->nb[1]);
+            // Use the compute-time snapshot of the selection tensor: the biased
+            // probs snapshot when present (true top_k input), else plain probs
+            // + per-expert bias from the persistent model tensor.
+            std::vector<float> sel;
+            auto it_b = tracer->snap.find("ffn_moe_probs_biased-" + std::to_string(e.il));
+            auto it_p = tracer->snap.find("ffn_moe_probs-"        + std::to_string(e.il));
+            if (it_b != tracer->snap.end()) {
+                sel = it_b->second;
+            } else if (it_p != tracer->snap.end()) {
+                sel = it_p->second;
+                const ggml_tensor * bias_t = lctx.model.layers[e.il].ffn_exp_probs_b;
+                if (bias_t && bias_t->type == GGML_TYPE_F32 && ggml_nelements(bias_t) == n_expert) {
+                    std::vector<float> bias(n_expert);
+                    ggml_backend_tensor_get(bias_t, bias.data(), 0, (size_t) n_expert * sizeof(float));
+                    for (size_t i = 0; i < sel.size(); i++) sel[i] += bias[i % (size_t) n_expert];
+                }
+            } else {
+                continue;
             }
+            const int32_t n_cols = (int32_t) (sel.size() / (size_t) n_expert);
             if (n_cols != (int32_t) e.topk->ne[1] || n_expert <= 0) {
-                fprintf(stderr, "EXPVERIFY layer %2d: width mismatch probs [%d x %d] vs topk [%d x %d]\n",
+                static int width_dump = 4;
+                if (width_dump-- > 0) fprintf(stderr, "EXPVERIFY layer %2d: width mismatch snap [%d x %d] vs topk [%d x %d]\n",
                         e.il, n_expert, n_cols, (int) e.topk->ne[0], (int) e.topk->ne[1]);
                 continue;
             }
-            // flat readback (assumes row stride == n_expert*4)
-            std::vector<float> probs((size_t) n_expert * n_cols);
-            ggml_backend_tensor_get(e.probs, probs.data(), 0, probs.size() * sizeof(float));
-            // stride-aware readback (row c at byte offset c*nb[1])
-            std::vector<float> probs_sa((size_t) n_expert * n_cols);
+            double ov_sum = 0; int exact = 0;
             for (int32_t c = 0; c < n_cols; c++) {
-                ggml_backend_tensor_get(e.probs, probs_sa.data() + (size_t) c * n_expert,
-                                        (size_t) c * e.probs->nb[1], (size_t) n_expert * sizeof(float));
-            }
-            double ov_sum = 0, ov_sum_sa = 0;
-            int    exact  = 0, exact_sa = 0;
-            for (int32_t c = 0; c < n_cols; c++) {
-                const int32_t * got = ids_ptrs[l] + (size_t) c * n_topk;
-                for (int pass = 0; pass < 2; pass++) {
-                    const float * colp = (pass == 0 ? probs : probs_sa).data() + (size_t) c * n_expert;
-                    std::vector<int32_t> ord(n_expert);
-                    std::iota(ord.begin(), ord.end(), 0);
-                    std::partial_sort(ord.begin(), ord.begin() + n_topk, ord.end(),
-                            [&](int32_t a, int32_t b) { return colp[a] > colp[b]; });
-                    int32_t ov = 0;
-                    for (int32_t k = 0; k < n_topk; k++) {
-                        for (int32_t j = 0; j < n_topk; j++) {
-                            ov += got[j] == ord[k];
-                        }
+                const int32_t * got  = ids_ptrs[l] + (size_t) c * n_topk;
+                const float   * colp = sel.data() + (size_t) c * n_expert;
+                std::vector<int32_t> ord(n_expert);
+                std::iota(ord.begin(), ord.end(), 0);
+                std::partial_sort(ord.begin(), ord.begin() + n_topk, ord.end(),
+                        [&](int32_t a, int32_t b) { return colp[a] > colp[b]; });
+                int32_t ov = 0;
+                for (int32_t k = 0; k < n_topk; k++) {
+                    for (int32_t j = 0; j < n_topk; j++) {
+                        ov += got[j] == ord[k];
                     }
-                    if (pass == 0) { ov_sum += ov; exact += ov == n_topk; }
-                    else           { ov_sum_sa += ov; exact_sa += ov == n_topk; }
                 }
+                ov_sum += ov; exact += ov == n_topk;
                 if (l == 0 && c == 0) {
                     fprintf(stderr, "EXPVERIFY l0 c0: gpu ids");
-                    for (int32_t k = 0; k < n_topk; k++) fprintf(stderr, " %d", got[k]);
+                    for (int32_t k = 0; k < n_topk; k++) fprintf(stderr, " %d(%.4f)", got[k], colp[got[k]]);
+                    fprintf(stderr, " | recomputed");
+                    for (int32_t k = 0; k < n_topk; k++) fprintf(stderr, " %d(%.4f)", ord[k], colp[ord[k]]);
                     fprintf(stderr, "\n");
                 }
             }
-            fprintf(stderr, "EXPVERIFY layer %2d: cols %d, exact-set %d, mean overlap %.3f/%d | stride-aware exact %d, overlap %.3f\n",
-                    e.il, n_cols, exact, n_cols ? ov_sum / n_cols : 0.0, n_topk,
-                    exact_sa, n_cols ? ov_sum_sa / n_cols : 0.0);
+            fprintf(stderr, "EXPVERIFY layer %2d: cols %d, exact-set %d, mean overlap %.3f/%d\n",
+                    e.il, n_cols, exact, n_cols ? ov_sum / n_cols : 0.0, n_topk);
         }
+        tracer->snap.clear();
     }
 
     // write one record, token-major:
@@ -12520,6 +12561,12 @@ bool llama_expert_trace_start(struct llama_context * ctx, const char * path) {
 
     auto tracer = std::make_unique<llama_context::llama_expert_tracer>();
     tracer->fp = fp;
+    if (getenv("IK_EXPVERIFY") != nullptr) {
+        // NOTE: llama_graph_compute re-installs the sched eval callback from
+        // cparams on every compute, so we must set it there, not on the sched.
+        ctx->cparams.cb_eval           = llama_expert_trace_snap_cb;
+        ctx->cparams.cb_eval_user_data = &tracer->snap;
+    }
     ctx->expert_tracer = std::move(tracer);
 
     LLAMA_LOG_INFO("%s: recording exact MoE expert selections to '%s'\n", __func__, path);
