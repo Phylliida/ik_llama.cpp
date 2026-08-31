@@ -489,6 +489,7 @@ extern "C" {
         int  attn_max_batch;    // maximum batch size for attention computations [EXPERIMENTAL]
         bool fused_moe_up_gate; // whether to use fused MoE up/gate op
         bool grouped_expert_routing; // whether to use grouped expert routing (BailingMoeV2 arch)
+        bool expert_trace;  // keep MoE router outputs (ffn_moe_topk/ffn_moe_weights) alive for llama_expert_trace_start
         bool fused_up_gate;     // whether to use fused up/gate op [EXPERIMENTAL]
         bool fused_mmad;        // whether to use fused mul+multi_add op [EXPERIMENTAL]
         bool rope_cache;        // whether to use RoPE cache [EXPERIMENTAL]
@@ -1126,6 +1127,31 @@ extern "C" {
     // This is automatically done when using one of the functions below to obtain the computation results
     // and is not necessary to call it explicitly in most cases
     LLAMA_API void llama_synchronize(struct llama_context * ctx);
+
+    // Expert-usage tracing (MoE models only).
+    // When enabled, the exact top-k expert indices selected by the router, together
+    // with the routing weights, are recorded for every token processed by llama_decode()
+    // (prompt processing and generation) and appended to the file at 'path'.
+    //
+    // Binary format:
+    //   char   magic[8] = "IKEXP001"
+    //   u32    n_moe_layers
+    //   repeat n_moe_layers: u32 layer_index, u32 n_expert, u32 n_topk
+    // then one record per llama_decode() ubatch:
+    //   u32    n_tokens
+    //   repeat n_tokens: i32 token_id (-1 if the batch carried embeddings), i32 pos
+    //   repeat n_tokens, repeat n_moe_layers: i32 expert_ids[n_topk], f32 expert_weights[n_topk]
+    //
+    // expert_ids are the exact router top-k indices and expert_weights the weights
+    // applied to the expert outputs (arch-dependent: may be normalized or raw gate
+    // probabilities). expert_ids are -1 for tokens that were never routed through
+    // that layer: during prompt processing the last layer's FFN is only computed
+    // for the tokens that need logits (n_outputs optimization).
+    //
+    // Returns false if the file could not be opened. Tracing adds one small
+    // device->host copy per MoE layer per ubatch; it is otherwise free.
+    LLAMA_API bool llama_expert_trace_start(struct llama_context * ctx, const char * path);
+    LLAMA_API void llama_expert_trace_stop (struct llama_context * ctx);
 
     // Token logits obtained from the last call to llama_decode()
     // The logits for which llama_batch.logits[i] != 0 are stored contiguously

@@ -3063,6 +3063,13 @@ ggml_cgraph * llm_build_context::llama_build_graph(
 
     llm.free();
 
+    if (lctx.cparams.expert_trace) {
+        // keep the router outputs alive so they can be read back after compute
+        // (must happen for every built graph, including the reserve graph,
+        // before the scheduler's allocator derives its cached offsets)
+        llama_expert_trace_mark_outputs(result);
+    }
+
 #if IK_PRINT_TIMING
     auto tim2 = ggml_time_us();
     printf("%s(...): %d us\n", __func__, int(tim2-tim1));

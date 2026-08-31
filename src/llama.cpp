@@ -6310,6 +6310,246 @@ static size_t llama_output_reserve(llama_context & lctx, size_t n_outputs) {
 }
 
 
+//
+// MoE expert-usage tracing
+//
+// Records, for every token processed by llama_decode_internal(), the exact
+// top-k expert indices chosen by each MoE layer's router plus the routing
+// weights actually applied. The data lives in small graph tensors
+// ("ffn_moe_topk-<il>": [n_topk, n_tokens] i32 and the matching
+// "ffn_moe_weights*" tensor), so the only extra cost is one tiny
+// device->host copy per MoE layer per ubatch.
+//
+
+struct llama_context::llama_expert_tracer {
+    FILE * fp = nullptr;
+
+    bool header_written = false;
+
+    struct layer_info {
+        int32_t layer_idx = -1;
+        int32_t n_expert  = 0;
+        int32_t n_topk    = 0;
+    };
+    std::vector<layer_info> layers;
+
+    ~llama_expert_tracer() {
+        if (fp) {
+            fclose(fp);
+        }
+    }
+};
+
+// Mark the router output tensors as graph outputs so that the ggml allocator
+// keeps their data alive until the end of the graph compute (intermediate
+// tensors are otherwise freed/reused by later nodes before we can read them).
+// Must be called on every freshly built graph (including the reserve/worst-case
+// graph built at context creation) so that the cached allocation offsets account
+// for the kept-alive tensors; called from llm_build_context::llama_build_graph.
+void llama_expert_trace_mark_outputs(ggml_cgraph * gf) {
+    static const char * wgt_prefixes[] = {
+        "ffn_moe_weights_scaled-", "ffn_moe_weights_norm-", "ffn_moe_weights_softmax-", "ffn_moe_weights-",
+    };
+
+    // flag a tensor, its whole view chain, and the direct parents of every
+    // element in that chain. The allocator keeps flagged tensors alive, but
+    // (a) a view's data lives in its source, and (b) e.g. ggml_argsort (used
+    // by ggml_top_k) reuses its parent's buffer in place, so the parents must
+    // be flagged as well or the data is overwritten by later layers.
+    auto flag_chain = [](ggml_tensor * t) {
+        for (ggml_tensor * cur = t; cur != nullptr; cur = cur->view_src) {
+            cur->flags |= GGML_TENSOR_FLAG_OUTPUT;
+            for (int j = 0; j < GGML_MAX_SRC; j++) {
+                if (cur->src[j]) {
+                    cur->src[j]->flags |= GGML_TENSOR_FLAG_OUTPUT;
+                }
+            }
+        }
+    };
+
+    for (int i = 0; i < gf->n_nodes; i++) {
+        ggml_tensor * node = gf->nodes[i];
+        const char  * name = node->name;
+        if (strncmp(name, "ffn_moe_topk-", 13) == 0) {
+            flag_chain(node);
+            continue;
+        }
+        for (const char * prefix : wgt_prefixes) {
+            if (strncmp(name, prefix, strlen(prefix)) == 0) {
+                flag_chain(node);
+                break;
+            }
+        }
+    }
+};
+
+static void llama_expert_trace_record(
+        llama_context & lctx,
+          ggml_cgraph * gf,
+     const llama_batch & ubatch) {
+
+    auto & tracer = lctx.expert_tracer;
+    if (!tracer || !tracer->fp) {
+        return;
+    }
+
+    // collect router outputs for every MoE layer in this graph.
+    // for the weights, prefer the tensor that is actually applied to the
+    // expert outputs (i.e. after any norm/scale/softmax fixup).
+    static const std::vector<std::pair<const char *, int>> wgt_prefixes = {
+        { "ffn_moe_weights_scaled-",  3 },
+        { "ffn_moe_weights_norm-",    2 },
+        { "ffn_moe_weights_softmax-", 1 },
+        { "ffn_moe_weights-",         0 },
+    };
+
+    struct moe_found {
+        int32_t      il   = -1;
+        ggml_tensor *topk = nullptr;
+        ggml_tensor *wgt  = nullptr;
+        int          wgt_prio = -1;
+    };
+    std::map<int32_t, moe_found> moe_map;
+
+    for (int i = 0; i < gf->n_nodes; i++) {
+        ggml_tensor * node = gf->nodes[i];
+        const char  * name = node->name;
+        if (strncmp(name, "ffn_moe_topk-", 13) == 0) {
+            auto & e = moe_map[atoi(name + 13)];
+            e.il   = atoi(name + 13);
+            e.topk = node;
+            continue;
+        }
+        for (const auto & [prefix, prio] : wgt_prefixes) {
+            const size_t plen = strlen(prefix);
+            if (strncmp(name, prefix, plen) == 0 && prio > moe_map[atoi(name + plen)].wgt_prio) {
+                auto & e = moe_map[atoi(name + plen)];
+                e.il       = atoi(name + plen);
+                e.wgt      = node;
+                e.wgt_prio = prio;
+                break;
+            }
+        }
+    }
+
+    // drop layers without a topk node (can only happen for non-MoE layers)
+    std::vector<moe_found> moe;
+    for (auto & [il, e] : moe_map) {
+        if (e.topk) {
+            moe.push_back(e);
+        }
+    }
+    if (moe.empty()) {
+        return; // dense model or no MoE in this graph: nothing to record
+    }
+
+    const int32_t n_tokens = ubatch.n_tokens;
+    if (n_tokens <= 0) {
+        return;
+    }
+
+    // make sure all backends are done computing before reading the tensors
+    ggml_backend_sched_synchronize(lctx.sched);
+
+    // The last layer(s) may only be computed for the tokens that need logits
+    // (n_outputs optimization). Map each ubatch token to its column in the
+    // router output tensors: full [k, n_tokens] tensors use the token index
+    // directly, trimmed [k, n_outputs] tensors only cover the logits-flagged
+    // tokens in order; tokens that were never routed get the -1 sentinel.
+    std::vector<int32_t> col_of_token(n_tokens, -1);
+    {
+        int32_t col = 0;
+        if (ubatch.logits) {
+            for (int32_t t = 0; t < n_tokens; t++) {
+                if (ubatch.logits[t]) {
+                    col_of_token[t] = col++;
+                }
+            }
+        } else {
+            for (int32_t t = 0; t < n_tokens; t++) {
+                col_of_token[t] = t;
+            }
+        }
+    }
+
+    if (!tracer->header_written) {
+        char     magic[8] = { 'I', 'K', 'E', 'X', 'P', '0', '0', '1' };
+        uint32_t n_layers = (uint32_t) moe.size();
+        fwrite(magic,     1, 8, tracer->fp);
+        fwrite(&n_layers, 4, 1, tracer->fp);
+        for (const auto & e : moe) {
+            // topk is [n_topk, n_tokens]; its src[0] is the router probs [n_expert, n_tokens]
+            uint32_t layer_idx = (uint32_t) e.il;
+            uint32_t n_expert  = (uint32_t) (e.topk->src[0] ? e.topk->src[0]->ne[0] : 0);
+            uint32_t n_topk    = (uint32_t) e.topk->ne[0];
+            fwrite(&layer_idx, 4, 1, tracer->fp);
+            fwrite(&n_expert,  4, 1, tracer->fp);
+            fwrite(&n_topk,    4, 1, tracer->fp);
+            tracer->layers.push_back({ (int32_t) layer_idx, (int32_t) n_expert, (int32_t) n_topk });
+        }
+        tracer->header_written = true;
+    }
+
+    // read back each layer's router outputs (layer-major [n_topk, n_tokens])
+    const int32_t n_layers = (int32_t) moe.size();
+    std::vector<const int32_t *> ids_ptrs(n_layers, nullptr);
+    std::vector<const float *>   wgt_ptrs(n_layers, nullptr);
+    std::vector<std::vector<int32_t>> ids_all(n_layers);
+    std::vector<std::vector<float>>   wgt_all(n_layers);
+
+    for (int32_t l = 0; l < n_layers; l++) {
+        const auto & e = moe[l];
+        const size_t n_vals = (size_t) e.topk->ne[0] * e.topk->ne[1];
+        const bool width_ok = e.topk->ne[1] == n_tokens ||
+                             (ubatch.logits && (int64_t) e.topk->ne[1] == std::count_if(col_of_token.begin(), col_of_token.end(), [](int32_t c) { return c >= 0; }));
+        if (e.topk->type != GGML_TYPE_I32 || !width_ok || e.topk->ne[0] != tracer->layers[l].n_topk) {
+            continue; // unexpected shape/type: leave this layer as -1 sentinel
+        }
+
+        ids_all[l].resize(n_vals);
+        ggml_backend_tensor_get(e.topk, ids_all[l].data(), 0, n_vals * sizeof(int32_t));
+        ids_ptrs[l] = ids_all[l].data();
+
+        if (e.wgt && e.wgt->type == GGML_TYPE_F32 && (size_t) ggml_nelements(e.wgt) == n_vals) {
+            wgt_all[l].resize(n_vals);
+            ggml_backend_tensor_get(e.wgt, wgt_all[l].data(), 0, n_vals * sizeof(float));
+            wgt_ptrs[l] = wgt_all[l].data();
+        }
+    }
+
+    // write one record, token-major:
+    //   u32 n_tokens
+    //   n_tokens x { i32 token_id, i32 pos }
+    //   n_tokens x n_layers x { i32 expert_ids[n_topk], f32 expert_weights[n_topk] }
+    fwrite(&n_tokens, 4, 1, tracer->fp);
+
+    for (int32_t t = 0; t < n_tokens; t++) {
+        int32_t token_id = ubatch.token ? ubatch.token[t] : -1;
+        int32_t pos      = ubatch.pos   ? ubatch.pos[t]   : -1;
+        fwrite(&token_id, 4, 1, tracer->fp);
+        fwrite(&pos,      4, 1, tracer->fp);
+    }
+
+    int32_t max_topk = 0;
+    for (const auto & li : tracer->layers) {
+        max_topk = std::max(max_topk, li.n_topk);
+    }
+    const std::vector<int32_t> null_ids(max_topk, -1); // sentinel: token was not routed through this layer
+    const std::vector<float>   null_wgt(max_topk, 0.0f);
+    for (int32_t t = 0; t < n_tokens; t++) {
+        for (int32_t l = 0; l < n_layers; l++) {
+            const int32_t n_topk = tracer->layers[l].n_topk;
+            // for full-width tensors use the token index; for trimmed ones use the logits-column map
+            const int32_t col    = moe[l].topk && moe[l].topk->ne[1] == n_tokens ? t : col_of_token[t];
+            const int32_t * ids  = ids_ptrs[l] && col >= 0 ? ids_ptrs[l] + (size_t) col * n_topk : null_ids.data();
+            const float   * wgt  = wgt_ptrs[l] && col >= 0 ? wgt_ptrs[l] + (size_t) col * n_topk : null_wgt.data();
+            fwrite(ids, 4, n_topk, tracer->fp);
+            fwrite(wgt, 4, n_topk, tracer->fp);
+        }
+    }
+    fflush(tracer->fp);
+}
+
 static void llama_graph_compute(
         llama_context & lctx,
           ggml_cgraph * gf,
@@ -6714,6 +6954,7 @@ static int llama_decode_internal(
 #endif
 
             gf = llm_build_context::llama_build_graph(lctx, u_batch, false);
+
 #if IK_PRINT_TIMING
             tim2 = ggml_time_us();
             printf("build_graph(...): %d us\n", int(tim2-tim1));
@@ -6824,6 +7065,10 @@ static int llama_decode_internal(
 #endif
         //fprintf(stderr, "%s: invoking llama_graph_compute\n", __func__);
         llama_graph_compute(lctx, gf, n_threads);
+
+        if (lctx.expert_tracer) {
+            llama_expert_trace_record(lctx, gf, u_batch);
+        }
 
         if (lctx.model.arch == LLM_ARCH_DEEPSEEK4 &&
             lctx.cparams.mtp_op_type == MTP_OP_NONE &&
@@ -7944,6 +8189,7 @@ struct llama_context_params llama_context_default_params() {
         /*.attn_max_batch              =*/ 256,
         /*.fused_moe_up_gate           =*/ true,
         /*.grouped_expert_routing      =*/ false,
+        /*.expert_trace                =*/ false,
         /*.fused_up_gate               =*/ true,
         /*.fused_mmad                  =*/ true,
         /*.rope_cache                  =*/ false,
@@ -8434,6 +8680,7 @@ struct llama_context * llama_init_from_model(
     cparams.attn_max_batch   = params.attn_max_batch;
     cparams.fused_moe_up_gate= params.fused_moe_up_gate;
     cparams.grouped_expert_routing = params.grouped_expert_routing;
+    cparams.expert_trace           = params.expert_trace;
     cparams.fused_up_gate    = params.fused_up_gate;
     cparams.fused_mmad       = params.fused_mmad;
     cparams.rope_cache       = params.rope_cache;
@@ -12017,7 +12264,6 @@ void llama_set_mtp_n_heads(llama_context * ctx, int32_t mtp_n_heads) {
 
 void llama_synchronize(struct llama_context * ctx) {
     ggml_backend_sched_synchronize(ctx->sched);
-
     // FIXME: if multiple single tokens are evaluated without a synchronization,
     // the stats will be added to the prompt evaluation stats
     // this should only happen when using batch size 1 to evaluate a batch
@@ -12039,6 +12285,32 @@ void llama_synchronize(struct llama_context * ctx) {
 
     ctx->n_queued_tokens = 0;
     ctx->t_compute_start_us = 0;
+}
+
+bool llama_expert_trace_start(struct llama_context * ctx, const char * path) {
+    if (!ctx->cparams.expert_trace) {
+        LLAMA_LOG_ERROR("%s: context was not created with expert_trace=true; refusing to trace\n", __func__);
+        return false;
+    }
+
+    ctx->expert_tracer.reset();
+
+    FILE * fp = fopen(path, "wb");
+    if (!fp) {
+        LLAMA_LOG_ERROR("%s: failed to open expert trace file '%s'\n", __func__, path);
+        return false;
+    }
+
+    auto tracer = std::make_unique<llama_context::llama_expert_tracer>();
+    tracer->fp = fp;
+    ctx->expert_tracer = std::move(tracer);
+
+    LLAMA_LOG_INFO("%s: recording exact MoE expert selections to '%s'\n", __func__, path);
+    return true;
+}
+
+void llama_expert_trace_stop(struct llama_context * ctx) {
+    ctx->expert_tracer.reset();
 }
 
 float * llama_get_logits(struct llama_context * ctx) {

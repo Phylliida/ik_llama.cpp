@@ -215,6 +215,16 @@ int main(int argc, char ** argv) {
 
     model = llama_init.model;
     ctx = llama_init.context;
+
+    if (!params.expert_trace.empty()) {
+        if (!llama_expert_trace_start(ctx, params.expert_trace.c_str())) {
+            LOG_TEE("%s: error: failed to open expert trace file '%s'\n", __func__, params.expert_trace.c_str());
+            llama_free(ctx);
+            llama_free_model(model);
+            llama_backend_free();
+            return 1;
+        }
+    }
     if (sparams.cfg_scale > 1.f) {
         struct llama_context_params lparams = common_context_params_to_llama(params);
         ctx_guidance = llama_init_from_model(model, lparams);

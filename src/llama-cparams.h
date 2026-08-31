@@ -35,6 +35,7 @@ struct llama_cparams {
     int  attn_max_batch;
     bool fused_moe_up_gate;
     bool grouped_expert_routing;
+    bool expert_trace;
     bool fused_up_gate;
     bool fused_mmad;
     bool rope_cache;

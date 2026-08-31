@@ -13,6 +13,10 @@ struct llama_cparams;
 struct llama_batch;
 struct llama_kv_cache;
 
+// Mark MoE router output tensors as graph outputs so their data stays valid
+// until post-compute readback (expert-usage tracing, see llama.cpp).
+void llama_expert_trace_mark_outputs(struct ggml_cgraph * gf);
+
 struct ggml_cgraph;
 struct ggml_tensor;
 

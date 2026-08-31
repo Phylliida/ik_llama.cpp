@@ -11,6 +11,8 @@
 
 #include "iqk_config.h"
 
+#include <cstdint>
+
 #if defined IQK_IMPLEMENT
 
 #include <cstring>

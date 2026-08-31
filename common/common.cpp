@@ -1224,6 +1224,11 @@ bool gpt_params_find_arg(int argc, char ** argv, const std::string & arg, gpt_pa
         params.prompt_is_binary = false;
         return true;
     }
+    if (arg == "--expert-trace") {
+        CHECK_ARG
+        params.expert_trace = argv[i];
+        return true;
+    }
     if (arg == "--in-file") {
         CHECK_ARG
         std::ifstream file(argv[i]);
@@ -3103,6 +3108,8 @@ void gpt_params_print_usage(int /*argc*/, char ** argv, const gpt_params & param
                                                                         "in conversation mode, this will be used as system prompt\n"
                                                                         "(default: '%s')", params.prompt.c_str() });
     options.push_back({ "*",           "-f,    --file FNAME",           "a file containing the prompt (default: none)" });
+    options.push_back({ "*",           "       --expert-trace FNAME",   "record exact per-token MoE expert selections (ids + routing weights)\n"
+                                                                        "to binary file FNAME (prompt and generated tokens)" });
     options.push_back({ "*",           "       --in-file FNAME",        "an input file (repeat to specify multiple files)" });
     options.push_back({ "*",           "-bf,   --binary-file FNAME",    "binary file containing the prompt (default: none)" });
     options.push_back({ "*",           "-e,    --escape",               "process escapes sequences (\\n, \\r, \\t, \\', \\\", \\\\) (default: %s)", params.escape ? "true" : "false" });
@@ -4357,6 +4364,7 @@ struct llama_context_params common_context_params_to_llama(const gpt_params & pa
     cparams.attn_max_batch    = params.attn_max_batch;
     cparams.fused_moe_up_gate = params.fused_moe_up_gate;
     cparams.grouped_expert_routing = params.grouped_expert_routing;
+    cparams.expert_trace = !params.expert_trace.empty();
     cparams.fused_up_gate     = params.fused_up_gate;
     cparams.fused_mmad        = params.fused_mmad;
     cparams.rope_cache        = params.rope_cache;

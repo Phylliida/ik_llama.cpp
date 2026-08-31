@@ -494,6 +494,9 @@ struct gpt_params {
     std::string mtmd_kq_type = "f32";
     int32_t n_threads_mtmd = -1; // number of threads to use for multimodal processing (-1 = use n_threads_batch, then n_threads)
 
+    // MoE expert-usage tracing
+    std::string expert_trace = "";  // if set, record exact per-token expert selections to this file
+
     // embedding
     bool embedding         = false; // get only sentence embedding
     int32_t embd_normalize = 2;     // normalization for embeddings (-1=none, 0=max absolute int16, 1=taxicab, 2=euclidean, >2=p-norm)

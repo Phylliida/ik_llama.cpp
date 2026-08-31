@@ -393,6 +393,10 @@ struct llama_context {
     ggml_abort_callback abort_callback      = nullptr;
     void *              abort_callback_data = nullptr;
 
+    // MoE expert-usage tracer (see llama_expert_trace_start in llama.h)
+    struct llama_expert_tracer;
+    std::unique_ptr<llama_expert_tracer> expert_tracer;
+
     const float * draft_input_hidden_state = nullptr;
     size_t draft_input_hidden_state_n_floats = 0;
     std::vector<float> draft_input_hidden_state_owned;
