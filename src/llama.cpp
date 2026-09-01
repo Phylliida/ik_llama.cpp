@@ -5019,6 +5019,127 @@ static bool llm_load_tensors(
         }
     }
 
+    // Phase 4: dynamic expert cache — allocate and fill the per-layer resident slot
+    // tensors (ffn_{up,gate,down}_exps_hot), H+1 expert slots each (slot H = trash).
+    // Slicing is a contiguous memcpy: the expert index is the last tensor dim.
+    if ((model.expert_cache_h > 0 || model.expert_cache_gb > 0) && !dry_run) {
+        if (model.expert_cache_h > 0 && model.expert_cache_gb > 0) {
+            throw std::runtime_error("use only one of --expert-cache / --expert-cache-gb");
+        }
+        if (!ml.use_mmap && ml.repack_tensors) {
+            LLAMA_LOG_WARN("%s: --expert-cache is incompatible with repacked tensors; disabling cache\n", __func__);
+            model.expert_cache_h = 0; model.expert_cache_gb = 0;
+        }
+        // collect cacheable layers: separate up/gate/down expert tensors, no merged variant
+        std::vector<int> cache_layers;
+        for (int il = 0; il < (int) model.layers.size(); il++) {
+            const auto & layer = model.layers[il];
+            if (layer.ffn_up_exps && layer.ffn_gate_exps && layer.ffn_down_exps && !layer.ffn_up_gate_exps) {
+                cache_layers.push_back(il);
+            }
+        }
+        if (cache_layers.empty() && (model.expert_cache_h > 0 || model.expert_cache_gb > 0)) {
+            LLAMA_LOG_WARN("%s: --expert-cache: no eligible MoE layers (separate up/gate/down tensors); disabling\n", __func__);
+            model.expert_cache_h = 0; model.expert_cache_gb = 0;
+        }
+        if (!cache_layers.empty()) {
+            // resolve --expert-cache-gb to a uniform slot count from real tensor sizes
+            if (model.expert_cache_gb > 0) {
+                double bytes_per_slot_all = 0;
+                for (int il : cache_layers) {
+                    const auto & layer = model.layers[il];
+                    const int64_t ne2 = layer.ffn_up_exps->ne[2];
+                    bytes_per_slot_all += (ggml_nbytes(layer.ffn_up_exps)   + ggml_nbytes(layer.ffn_gate_exps) +
+                                           ggml_nbytes(layer.ffn_down_exps)) / (double) ne2;
+                }
+                model.expert_cache_h = (int32_t) (model.expert_cache_gb * (double) (1 << 30) / bytes_per_slot_all);
+                LLAMA_LOG_INFO("%s: --expert-cache-gb %.2f -> H=%d slots/layer (%.2f MB/slice, %zu layers)\n", __func__,
+                        (double) model.expert_cache_gb, model.expert_cache_h, bytes_per_slot_all / 1048576.0, cache_layers.size());
+            }
+            const int64_t n_expert = model.layers[cache_layers[0]].ffn_up_exps->ne[2];
+            if (model.expert_cache_h > n_expert - 1) {
+                LLAMA_LOG_WARN("%s: clamping expert cache H %d -> %d (n_expert=%d)\n", __func__,
+                        model.expert_cache_h, (int) n_expert - 1, (int) n_expert);
+                model.expert_cache_h = n_expert - 1;
+            }
+            if (model.expert_cache_h <= 0) {
+                LLAMA_LOG_WARN("%s: expert cache budget too small (H=%d); disabling\n", __func__, model.expert_cache_h);
+                model.expert_cache_h = 0;
+            }
+        }
+        if (model.expert_cache_h > 0) {
+            const int64_t H = model.expert_cache_h;
+            struct ggml_init_params ip = {
+                /*.mem_size   =*/ ggml_tensor_overhead() * 3 * cache_layers.size(),
+                /*.mem_buffer =*/ NULL,
+                /*.no_alloc   =*/ true,
+            };
+            ggml_context * ectx = ggml_init(ip);
+            if (!ectx) {
+                throw std::runtime_error("failed to create expert cache context");
+            }
+            for (int il : cache_layers) {
+                auto & layer = model.layers[il];
+                auto mk = [&](ggml_tensor * src, const char * tag) {
+                    ggml_tensor * t = ggml_new_tensor_3d(ectx, src->type, src->ne[0], src->ne[1], H + 1);
+                    snprintf(t->name, GGML_MAX_NAME, "blk.%d.ffn_%s_exps.hot", il, tag);
+                    return t;
+                };
+                layer.ffn_up_exps_hot   = mk(layer.ffn_up_exps,   "up");
+                layer.ffn_gate_exps_hot = mk(layer.ffn_gate_exps, "gate");
+                layer.ffn_down_exps_hot = mk(layer.ffn_down_exps, "down");
+            }
+            // M1: pinned host buffer (same buft as -ot exps=CPU); M2 moves this to CUDA0
+            ggml_backend_buffer_type_t buft = llama_default_buffer_type_cpu(true);
+            ggml_backend_buffer_t buf = ggml_backend_alloc_ctx_tensors_from_buft(ectx, buft);
+            if (!buf) {
+                throw std::runtime_error("failed to allocate expert cache buffer");
+            }
+            ggml_backend_buffer_set_usage(buf, GGML_BACKEND_BUFFER_USAGE_WEIGHTS);
+            model.ctxs.push_back(ectx);
+            model.bufs.push_back(buf);
+
+            // static dummy content: slot s <- expert s (s < H); trash slot H <- expert 0
+            // (any valid quantized data works; content is managed dynamically from M3 on)
+            std::vector<uint8_t> scratch;
+            for (int il : cache_layers) {
+                auto & layer = model.layers[il];
+                auto fill = [&](ggml_tensor * src, ggml_tensor * dst) {
+                    const int64_t n_src_e = src->ne[2];
+                    const size_t src_esize = src->nb[2];
+                    const size_t dst_esize = dst->nb[2];
+                    GGML_ASSERT(dst_esize >= src_esize);
+                    GGML_ASSERT(src->type == dst->type && src->ne[0] == dst->ne[0] && src->ne[1] == dst->ne[1]);
+                    for (int64_t s = 0; s <= H; s++) {
+                        const int64_t e = s < H ? s : 0;
+                        GGML_ASSERT(e < n_src_e);
+                        char * dptr = (char *) dst->data + s * dst_esize;
+                        if (ggml_backend_buffer_is_host(src->buffer)) {
+                            memcpy(dptr, (const char *) src->data + e * src_esize, src_esize);
+                        } else {
+                            scratch.resize(src_esize);
+                            ggml_backend_tensor_get(src, scratch.data(), e * src_esize, src_esize);
+                            memcpy(dptr, scratch.data(), src_esize);
+                        }
+                    }
+                };
+                fill(layer.ffn_up_exps,   layer.ffn_up_exps_hot);
+                fill(layer.ffn_gate_exps, layer.ffn_gate_exps_hot);
+                fill(layer.ffn_down_exps, layer.ffn_down_exps_hot);
+            }
+            double tot_mb = 0;
+            for (int il : cache_layers) {
+                tot_mb += ggml_nbytes(model.layers[il].ffn_up_exps_hot) + ggml_nbytes(model.layers[il].ffn_gate_exps_hot) +
+                          ggml_nbytes(model.layers[il].ffn_down_exps_hot);
+            }
+            LLAMA_LOG_INFO("%s: expert cache: H=%d slots/layer x %zu layers, %.2f MiB total (%s)\n", __func__,
+                    (int) H, cache_layers.size(), tot_mb / 1048576.0, ggml_backend_buffer_name(buf));
+            for (auto * t = ggml_get_first_tensor(ectx); t != NULL; t = ggml_get_next_tensor(ectx, t)) {
+                model.tensors_by_name.emplace_back(ggml_get_name(t), t);
+            }
+        }
+    }
+
     if (!overrides.empty()) {
         for (auto & o : overrides) {
             if (o.pattern) free(const_cast<char*>(o.pattern));
@@ -5043,6 +5164,9 @@ static int llama_model_load(const std::string & fname, llama_model & model, llam
         model.hparams.vocab_only = params.vocab_only;
 
         model.mtp = params.mtp;
+
+        model.expert_cache_h  = params.expert_cache_h;
+        model.expert_cache_gb = params.expert_cache_gb;
 
         try {
             llm_load_arch(ml, model);
@@ -6541,6 +6665,166 @@ static int llama_expert_trace_snap_cb(ggml_tensor * t, bool ask, void * user_dat
         (*snap)[n] = std::move(buf);
     }
     return true;
+}
+
+// -------------------------------------------------------------------------
+// Phase 4 dynamic expert cache: classify step.
+//
+// After each MoE layer's ffn_moe_topk-N node computes, map the routed expert
+// ids through the layer's remap table and program the three mask inputs of the
+// current graph (hot_ids / hot_mask / cold_ids). The scheduler synchronizes the
+// producing backend before invoking us with ask=false (need == 1), so tensor
+// reads are safe; writes land before the consuming expert nodes start.
+static int llama_expert_cache_eval_cb(ggml_tensor * t, bool ask, void * user_data) {
+    llama_context * lctx = (llama_context *) user_data;
+    const auto & cache = lctx->expert_cache;
+    if (!cache) {
+        return ask ? 0 : 1;
+    }
+    if (strncmp(t->name, "ffn_moe_topk-", 13) != 0) {
+        return ask ? 0 : 1;
+    }
+    const char * p = t->name + 13;
+    int32_t il = 0;
+    while (*p >= '0' && *p <= '9') {
+        il = 10*il + (*p - '0');
+        p++;
+    }
+    if (*p != '\0') {
+        return ask ? 0 : 1;
+    }
+    auto it = cache->layers.find(il);
+    if (it == cache->layers.end()) {
+        return ask ? 0 : 1;
+    }
+    if (ask) {
+        static int dbg_ask = -1;
+        if (dbg_ask < 0) {
+            dbg_ask = getenv("IK_EXP_CACHE_DEBUG") ? 1 : 0;
+        }
+        if (dbg_ask) {
+            static int n_ask = 0;
+            if (n_ask++ < 130) {
+                fprintf(stderr, "EXP_CACHE_ASK '%s' type=%d ne=[%lld %lld %lld] op=%d src0='%s'[%lld] vsrc='%s'[%lld]\n",
+                        t->name, (int) t->type,
+                        (long long) t->ne[0], (long long) t->ne[1], (long long) t->ne[2], (int) t->op,
+                        t->src[0] ? t->src[0]->name : "-", t->src[0] ? (long long) t->src[0]->ne[0] : -1ll,
+                        t->view_src ? t->view_src->name : "-", t->view_src ? (long long) t->view_src->ne[0] : -1ll);
+            }
+        }
+        return 1;
+    }
+
+    auto & cl = it->second;
+    ggml_tensor * hot_ids  = cl.hot_ids;
+    ggml_tensor * hot_mask = cl.hot_mask;
+    ggml_tensor * cold_ids = cl.cold_ids;
+    if (!hot_ids || !hot_mask || !cold_ids) {
+        return 1; // current graph was built without cache inputs for this layer
+    }
+    const int64_t k    = t->ne[0];
+    const int64_t ntok = t->ne[1];
+    if (t->type != GGML_TYPE_I32 || k <= 0 || ntok <= 0) {
+        return 1;
+    }
+    if (hot_ids->ne[0] != k || hot_ids->ne[1] != ntok || cold_ids->ne[0] != k || cold_ids->ne[1] != ntok ||
+        hot_mask->ne[0] != k || hot_mask->ne[1] != ntok) {
+        static bool warned_shape_mismatch = false;
+        if (!warned_shape_mismatch) {
+            warned_shape_mismatch = true;
+            LLAMA_LOG_WARN("expert cache: topk/mask shape mismatch on layer %d; leaving masks stale (won't warn again)\n", il);
+        }
+        return 1;
+    }
+
+    // read back the ids, honoring the actual row pitch (same convention as the tracer)
+    const size_t col_bytes = (size_t) k * sizeof(int32_t);
+    std::vector<int32_t> ids((size_t) k * ntok);
+    if (t->nb[1] == col_bytes) {
+        ggml_backend_tensor_get(t, ids.data(), 0, (size_t) k * ntok * sizeof(int32_t));
+    } else {
+        for (int64_t c = 0; c < ntok; c++) {
+            ggml_backend_tensor_get(t, ids.data() + (size_t) c * k, (size_t) c * t->nb[1], col_bytes);
+        }
+    }
+
+    const int32_t n_expert   = (int32_t) cl.remap.size();
+    const int32_t trash_slot = cache->h;
+    const bool    cuda_slots = cache->slots_on_cuda;
+
+    const bool host_hot  = !hot_ids->buffer  || ggml_backend_buffer_is_host(hot_ids->buffer);
+    const bool host_mask = !hot_mask->buffer || ggml_backend_buffer_is_host(hot_mask->buffer);
+    const bool host_cold = !cold_ids->buffer || ggml_backend_buffer_is_host(cold_ids->buffer);
+
+    // stage full [k, ntok] column-major outputs, then write per column
+    std::vector<int32_t> hot_all((size_t) k * ntok), cold_all((size_t) k * ntok);
+    std::vector<float>   mask_all((size_t) k * ntok);
+    for (int64_t c = 0; c < ntok; c++) {
+        for (int64_t j = 0; j < k; j++) {
+            const int32_t id   = ids[(size_t) c * k + j];
+            const int32_t slot = (id >= 0 && id < n_expert) ? cl.remap[id] : -1;
+            const bool    hit  = slot >= 0;
+            hot_all [(size_t) c * k + j] = hit ? slot : (cuda_slots ? trash_slot : -1);
+            cold_all[(size_t) c * k + j] = hit ? -1   : id;
+            mask_all[(size_t) c * k + j] = hit ? 1.0f : 0.0f;
+        }
+    }
+
+    auto write_cols = [&](ggml_tensor * dst, const void * src, size_t elem, bool host) {
+        for (int64_t c = 0; c < ntok; c++) {
+            const char * s = (const char *) src + (size_t) c * k * elem;
+            if (host) {
+                memcpy((char *) dst->data + (size_t) c * dst->nb[1], s, (size_t) k * elem);
+            } else {
+                ggml_backend_tensor_set(dst, s, (size_t) c * dst->nb[1], (size_t) k * elem);
+            }
+        }
+    };
+    write_cols(hot_ids,  hot_all.data(),  sizeof(int32_t), host_hot);
+    write_cols(cold_ids, cold_all.data(), sizeof(int32_t), host_cold);
+    write_cols(hot_mask, mask_all.data(), sizeof(float),   host_mask);
+
+    static int dbg = -1;
+    if (dbg < 0) {
+        dbg = getenv("IK_EXP_CACHE_DEBUG") ? 1 : 0;
+        if (dbg) {
+            fprintf(stderr, "EXP_CACHE_DEBUG: callback active\n");
+        }
+    }
+    if (dbg) {
+        static uint64_t n_calls = 0, n_hits = 0, n_miss = 0;
+        n_calls++;
+        if (il == 3 && n_calls <= 84) {
+            fprintf(stderr, "EXP_CACHE L%d ntok=%d k=%d ids0=%d slot=%d host=%d%d%d\n", il, (int) ntok, (int) k,
+                    ids[0], hot_all[0], host_hot, host_mask, host_cold);
+        }
+        for (size_t i = 0; i < (size_t) k * ntok; i++) {
+            (cold_all[i] >= 0) ? n_miss++ : n_hits++;
+        }
+        if (n_calls % 4200 == 0) {
+            fprintf(stderr, "EXP_CACHE calls=%llu hit=%llu miss=%llu (hit rate %.3f)\n",
+                    (unsigned long long) n_calls, (unsigned long long) n_hits, (unsigned long long) n_miss,
+                    n_hits + n_miss ? (double) n_hits / (n_hits + n_miss) : 0.0);
+        }
+    }
+
+    return 1;
+}
+
+static int llama_expert_cache_dispatch_cb(ggml_tensor * t, bool ask, void * user_data) {
+    llama_context * lctx = (llama_context *) user_data;
+    if (ask) {
+        int need = llama_expert_cache_eval_cb(t, true, lctx);
+        if (!need && lctx->chained_eval_cb) {
+            need = lctx->chained_eval_cb(t, true, lctx->chained_eval_ud);
+        }
+        return need;
+    }
+    int ok = llama_expert_cache_eval_cb(t, false, lctx);
+    if (lctx->chained_eval_cb) {
+        ok = lctx->chained_eval_cb(t, false, lctx->chained_eval_ud) && ok;
+    }
+    return ok;
 }
 
 // Mark the router output tensors as graph outputs so that the ggml allocator
@@ -8417,6 +8701,8 @@ struct llama_model_params llama_model_default_params() {
         /*.main_gpu                    =*/ 0,
         /*.max_gpu                     =*/ 0,
         /*.ncmoe                       =*/ 0,
+        /*.expert_cache_h              =*/ 0,
+        /*.expert_cache_gb             =*/ 0.0f,
         /*.type_k                      =*/ GGML_TYPE_F16,
         /*.type_v                      =*/ GGML_TYPE_F16,
         /*.idx_type_k                  =*/ GGML_TYPE_F16,
@@ -8526,6 +8812,8 @@ struct llama_context_params llama_context_default_params() {
         /*.only_active_experts         =*/ false,
         /*.prefetch_experts            =*/ false,
         /*.prefetch_experts_threads    =*/ 0,
+        /*.expert_cache_h              =*/ 0,
+        /*.expert_cache_promote_gbps   =*/ 8.0f,
         /*.k_cache_hadamard            =*/ false,
         /*.v_cache_hadamard            =*/ false,
         /*.split_mode_graph_scheduling =*/ false,
@@ -9004,6 +9292,8 @@ struct llama_context * llama_init_from_model(
     cparams.fused_moe_up_gate= params.fused_moe_up_gate;
     cparams.grouped_expert_routing = params.grouped_expert_routing;
     cparams.expert_trace           = params.expert_trace;
+    cparams.expert_cache_h         = params.expert_cache_h;
+    cparams.expert_cache_promote_gbps = params.expert_cache_promote_gbps;
     cparams.fused_up_gate    = params.fused_up_gate;
     cparams.fused_mmad       = params.fused_mmad;
     cparams.rope_cache       = params.rope_cache;
@@ -9027,6 +9317,44 @@ struct llama_context * llama_init_from_model(
         LLAMA_LOG_WARN("%s: --dsa is not active under -sm graph/attn (tensor-parallel attention has no indexer); running dense MLA\n", __func__);
     }
     cparams.prefetch_experts = params.prefetch_experts;
+
+    // Phase 4: dynamic expert cache — per-layer routing/placement state + the
+    // classify eval callback. Static dummy init: experts 0..H-1 resident (content
+    // matches the slot tensors filled at load); dynamism arrives with M3.
+    if (cparams.expert_cache_h > 0) {
+        if (model->expert_cache_h <= 0) {
+            LLAMA_LOG_WARN("%s: --expert-cache requested but the model has no cache slots (disabled at load?)\n", __func__);
+            cparams.expert_cache_h = 0;
+        } else if (cparams.expert_cache_h != model->expert_cache_h) {
+            LLAMA_LOG_INFO("%s: expert cache H resolved to %d at load (requested %d)\n", __func__,
+                    model->expert_cache_h, cparams.expert_cache_h);
+            cparams.expert_cache_h = model->expert_cache_h;
+        }
+    }
+    if (cparams.expert_cache_h > 0) {
+        const int32_t H = model->expert_cache_h;
+        ctx->expert_cache = std::make_unique<llama_context::expert_cache_state>();
+        ctx->expert_cache->h = H;
+        ctx->expert_cache->slots_on_cuda = false; // M1: slot tensors are pinned host memory
+        for (int il = 0; il < (int) model->layers.size(); il++) {
+            const auto & layer = model->layers[il];
+            if (!layer.ffn_up_exps_hot) {
+                continue;
+            }
+            const int32_t n_expert = layer.ffn_up_exps->ne[2];
+            auto & cl = ctx->expert_cache->layers[il];
+            cl.remap.resize(n_expert, -1);
+            cl.slot_expert.resize(H + 1, -1);
+            for (int32_t s = 0; s < H && s < n_expert; s++) {
+                cl.remap[s] = s;
+                cl.slot_expert[s] = s;
+            }
+        }
+        ctx->expert_cache_pending = true; // callback installed after params.cb_eval is copied below
+        LLAMA_LOG_INFO("%s: expert cache active: H=%d, %zu layers (static dummy assignment)\n", __func__,
+                H, ctx->expert_cache->layers.size());
+    }
+
     cparams.k_cache_hadamard = params.k_cache_hadamard;
     cparams.v_cache_hadamard = params.v_cache_hadamard;
     // Folding H into wv_b/wk_b_pp permanently mutates the model; a later context
@@ -9084,6 +9412,16 @@ struct llama_context * llama_init_from_model(
 
     cparams.cb_eval           = params.cb_eval;
     cparams.cb_eval_user_data = params.cb_eval_user_data;
+
+    if (ctx->expert_cache_pending) {
+        // route the sched eval callback through the expert-cache dispatcher; any
+        // pre-existing/user callback (and later --expert-trace IK_EXPVERIFY) is chained
+        ctx->chained_eval_cb      = cparams.cb_eval;
+        ctx->chained_eval_ud      = cparams.cb_eval_user_data;
+        cparams.cb_eval           = llama_expert_cache_dispatch_cb;
+        cparams.cb_eval_user_data = ctx;
+        ctx->expert_cache_pending = false;
+    }
 
     auto rope_scaling_type = params.rope_scaling_type;
     if (rope_scaling_type == LLAMA_ROPE_SCALING_TYPE_UNSPECIFIED) {
@@ -12642,8 +12980,14 @@ bool llama_expert_trace_start(struct llama_context * ctx, const char * path) {
     if (getenv("IK_EXPVERIFY") != nullptr) {
         // NOTE: llama_graph_compute re-installs the sched eval callback from
         // cparams on every compute, so we must set it there, not on the sched.
-        ctx->cparams.cb_eval           = llama_expert_trace_snap_cb;
-        ctx->cparams.cb_eval_user_data = &tracer->snap;
+        if (ctx->expert_cache) {
+            // the expert cache dispatcher owns cparams.cb_eval — chain through it
+            ctx->chained_eval_cb = llama_expert_trace_snap_cb;
+            ctx->chained_eval_ud = &tracer->snap;
+        } else {
+            ctx->cparams.cb_eval           = llama_expert_trace_snap_cb;
+            ctx->cparams.cb_eval_user_data = &tracer->snap;
+        }
     }
     ctx->expert_tracer = std::move(tracer);
 

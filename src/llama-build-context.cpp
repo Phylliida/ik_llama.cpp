@@ -1587,6 +1587,93 @@ llm_expert_gating_func_type   gating_op,
     //bool can_use_fmoe = !up_exps_b && !gate_exps_b && (type_op == LLM_FFN_SILU || type_op == LLM_FFN_GELU);
     bool can_use_fmoe = (type_op == LLM_FFN_SILU || type_op == LLM_FFN_GELU || type_op == LLM_FFN_SWIGLU_OAI);
 
+    // Phase 4 dynamic expert cache: two-path masked execution.
+    // Hot path runs routed experts that are resident in the per-layer slot tensors
+    // (ffn_*_exps_hot, H+1 slots; slot H = trash); the cold path runs the rest on the
+    // full expert tensors. Masks are VALUES in per-layer input tensors, refreshed
+    // each step by the expert-cache eval callback (see llama.cpp):
+    //   hot_ids  = slot of the routed expert, or -1 (CPU) / H (CUDA trash) on miss
+    //   hot_mask = 1.0 on hit, 0.0 on miss (zeroes the trash slot's contribution)
+    //   cold_ids = expert id on miss, -1 on hit (native -1 skip on CPU)
+    // Eligibility is intentionally narrow v1 (the glm5next/GLM-5.3-Flash shape):
+    // separate up/gate tensors, fused up+gate op, no biases, no fused_mmad tail.
+    auto * exp_cache = lctx.expert_cache.get();
+    llama_context::expert_cache_layer_state * exp_cache_l = nullptr;
+    if (exp_cache) {
+        auto it = exp_cache->layers.find(il);
+        if (it != exp_cache->layers.end()) {
+            exp_cache_l = &it->second;
+        }
+    }
+    const bool use_exp_cache = exp_cache_l
+            && up_exps && gate_exps && down_exps && !up_gate_exps
+            && lctx.model.layers[il].ffn_up_exps_hot
+            && !up_exps_b && !gate_exps_b && !down_exps_b && !down_exps_s
+            && can_use_fmoe && lctx.cparams.fused_moe_up_gate && up_exps->type == gate_exps->type
+            && !weight_before_ffn;
+
+    if (use_exp_cache) {
+        auto & cl = *exp_cache_l;
+
+        ggml_tensor * hot_ids  = ggml_new_tensor_2d(ctx, GGML_TYPE_I32, n_expert_used, n_tokens);
+        ggml_tensor * hot_mask = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, n_expert_used, n_tokens);
+        ggml_tensor * cold_ids = ggml_new_tensor_2d(ctx, GGML_TYPE_I32, n_expert_used, n_tokens);
+        ggml_set_input(hot_ids);
+        ggml_set_input(hot_mask);
+        ggml_set_input(cold_ids);
+        ggml_format_name(hot_ids,  "ffn_exp_cache_hot_ids-%d",  il);
+        ggml_format_name(hot_mask, "ffn_exp_cache_hot_mask-%d", il);
+        ggml_format_name(cold_ids, "ffn_exp_cache_cold_ids-%d", il);
+        cl.hot_ids = hot_ids; cl.hot_mask = hot_mask; cl.cold_ids = cold_ids;
+
+        const auto unary_op = type_op == LLM_FFN_SILU ? GGML_UNARY_OP_SILU : GGML_UNARY_OP_GELU;
+        auto & clayer = lctx.model.layers[il];
+
+        // HOT path on the resident slot tensors
+        ggml_tensor * par_hot = ggml_moe_up_gate(ctx, clayer.ffn_up_exps_hot, clayer.ffn_gate_exps_hot, cur, hot_ids, unary_op);
+        *((float *)(par_hot->op_params + 1)) = lctx.model.swiglu_limit(il, false);
+        cb(par_hot, "ffn_moe_gate_par_hot", il);
+
+        ggml_tensor * experts_hot = llm_build_lora_mm_id(lctx, ctx, clayer.ffn_down_exps_hot, par_hot, hot_ids);
+        cb(experts_hot, "ffn_moe_down_hot", il);
+
+        // mask the trash/miss rows: multiplication by exactly 1.0/0.0 is bitwise-neutral,
+        // so masked experts_hot == the hot experts' true outputs or zero rows
+        ggml_tensor * mask3d = ggml_reshape_3d(ctx, hot_mask, 1, n_expert_used, n_tokens);
+        experts_hot = ggml_mul(ctx, experts_hot, mask3d);
+        cb(experts_hot, "ffn_moe_masked_hot", il);
+
+        // COLD path on the full expert tensors (identical math to the single path)
+        ggml_tensor * par_cold = ggml_moe_up_gate(ctx, up_exps, gate_exps, cur, cold_ids, unary_op);
+        *((float *)(par_cold->op_params + 1)) = lctx.model.swiglu_limit(il, false);
+        cb(par_cold, "ffn_moe_gate_par_cold", il);
+
+        ggml_tensor * experts_cold = llm_build_lora_mm_id(lctx, ctx, down_exps, par_cold, cold_ids);
+        cb(experts_cold, "ffn_moe_down_cold", il);
+
+        // exactly one of the two paths is nonzero for each (j, token), so this add is
+        // bitwise-exact: the sum == the single path's `experts` tensor bit for bit
+        ggml_tensor * experts = ggml_add(ctx, experts_hot, experts_cold);
+        cb(experts, "ffn_moe_down", il);
+
+        // from here on, mirror the single-path tail exactly (fused or unfused) so the
+        // accumulation order and FMA usage are unchanged
+        ggml_tensor * result;
+        if (lctx.cparams.fused_mmad) {
+            result = ggml_mul_multi_add(ctx, experts, weights);
+            cb(result, "ffn_moe_weighted", il);
+        } else {
+            experts = ggml_mul(ctx, experts, weights);
+            cb(experts, "ffn_moe_weighted", il);
+            result = ggml_multi_add(ctx, ggml_view_2d(ctx, experts, n_embd, n_tokens, experts->nb[2], 0), n_expert_used);
+        }
+        if (add_input) {
+            cb(result, "ffn_out", il);
+            result = ggml_add(ctx, result, input);
+        }
+        return result;
+    }
+
     ggml_tensor * par;
     if (can_use_fmoe && up_gate_exps) {
         if (up_gate_exps_b || type_op == LLM_FFN_SWIGLU_OAI) {

@@ -397,6 +397,30 @@ struct llama_context {
     struct llama_expert_tracer;
     std::unique_ptr<llama_expert_tracer> expert_tracer;
 
+    // Phase 4 dynamic expert cache: per-layer routing/placement state.
+    // Placement-independent correctness: a cache miss always falls back to the
+    // cold (full-tensor) path; only placement changes, never the math domain.
+    struct expert_cache_layer_state {
+        std::vector<int32_t> remap;       // [n_expert] expert id -> slot | -1 (miss)
+        std::vector<int32_t> slot_expert; // [H+1] slot -> expert id | -1
+        // current-graph input tensors, refreshed at every graph build:
+        ggml_tensor * hot_ids  = nullptr; // I32 [n_expert_used, n_tokens] slot | -1 (CPU) / H-trash (CUDA)
+        ggml_tensor * hot_mask = nullptr; // F32 [n_expert_used, n_tokens] 1.0 hit / 0.0 miss
+        ggml_tensor * cold_ids = nullptr; // I32 [n_expert_used, n_tokens] expert id | -1 (hit)
+    };
+    struct expert_cache_state {
+        int32_t h = 0;                    // resident slots per layer
+        bool    slots_on_cuda = false;    // hot slot tensors live on a GPU backend (M2+)
+        std::map<int32_t, expert_cache_layer_state> layers; // keyed by layer index
+    };
+    std::unique_ptr<expert_cache_state> expert_cache;
+    bool expert_cache_pending = false; // install dispatcher once params.cb_eval has been copied
+
+    // when the expert cache dispatcher owns cparams.cb_eval, the previously
+    // installed callback (user's, or the tracer's IK_EXPVERIFY snap) is chained here
+    ggml_backend_sched_eval_callback chained_eval_cb = nullptr;
+    void *                           chained_eval_ud = nullptr;
+
     const float * draft_input_hidden_state = nullptr;
     size_t draft_input_hidden_state_n_floats = 0;
     std::vector<float> draft_input_hidden_state_owned;

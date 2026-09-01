@@ -1229,6 +1229,29 @@ bool gpt_params_find_arg(int argc, char ** argv, const std::string & arg, gpt_pa
         params.expert_trace = argv[i];
         return true;
     }
+    if (arg == "--expert-cache") {
+        CHECK_ARG
+        params.expert_cache_h = std::stoi(argv[i]);
+        if (params.expert_cache_h < 0) {
+            fprintf(stderr, "error: --expert-cache must be >= 0\n");
+            invalid_param = true;
+        }
+        return true;
+    }
+    if (arg == "--expert-cache-gb") {
+        CHECK_ARG
+        params.expert_cache_gb = std::stof(argv[i]);
+        if (params.expert_cache_gb < 0) {
+            fprintf(stderr, "error: --expert-cache-gb must be >= 0\n");
+            invalid_param = true;
+        }
+        return true;
+    }
+    if (arg == "--expert-cache-promote-gbps") {
+        CHECK_ARG
+        params.expert_cache_promote_gbps = std::stof(argv[i]);
+        return true;
+    }
     if (arg == "--in-file") {
         CHECK_ARG
         std::ifstream file(argv[i]);
@@ -3110,6 +3133,12 @@ void gpt_params_print_usage(int /*argc*/, char ** argv, const gpt_params & param
     options.push_back({ "*",           "-f,    --file FNAME",           "a file containing the prompt (default: none)" });
     options.push_back({ "*",           "       --expert-trace FNAME",   "record exact per-token MoE expert selections (ids + routing weights)\n"
                                                                         "to binary file FNAME (prompt and generated tokens)" });
+    options.push_back({ "*",           "       --expert-cache H",       "Phase 4 (experimental): dynamic per-layer MoE expert cache with H resident\n"
+                                                                        "slots per layer (default: %d = off)", params.expert_cache_h });
+    options.push_back({ "*",           "       --expert-cache-gb B",    "size the expert cache by total byte budget B (GB) instead of slot count" });
+    options.push_back({ "*",           "       --expert-cache-promote-gbps R",
+                                                                        "expert cache promotion rate cap in GB/s (default: %.1f, <=0 = unlimited)",
+                                                                        params.expert_cache_promote_gbps });
     options.push_back({ "*",           "       --in-file FNAME",        "an input file (repeat to specify multiple files)" });
     options.push_back({ "*",           "-bf,   --binary-file FNAME",    "binary file containing the prompt (default: none)" });
     options.push_back({ "*",           "-e,    --escape",               "process escapes sequences (\\n, \\r, \\t, \\', \\\", \\\\) (default: %s)", params.escape ? "true" : "false" });
@@ -4255,6 +4284,8 @@ struct llama_model_params common_model_params_to_llama(const gpt_params & params
     mparams.main_gpu        = params.main_gpu;
     mparams.max_gpu         = params.max_gpu;
     mparams.ncmoe           = params.ncmoe;
+    mparams.expert_cache_h  = params.expert_cache_h;
+    mparams.expert_cache_gb = params.expert_cache_gb;
     mparams.fit             = params.fit;
     mparams.fit_margin      = params.fit_margin;
     mparams.worst_graph_tokens = params.worst_graph_tokens;
@@ -4383,6 +4414,8 @@ struct llama_context_params common_context_params_to_llama(const gpt_params & pa
     cparams.only_active_experts = params.only_active_exps;
     cparams.prefetch_experts  = params.prefetch_experts;
     cparams.prefetch_experts_threads = params.prefetch_experts_threads;
+    cparams.expert_cache_h    = params.expert_cache_h;
+    cparams.expert_cache_promote_gbps = params.expert_cache_promote_gbps;
     cparams.max_extra_alloc   = params.max_extra_alloc_MiB;
     cparams.mtp               = params.has_mtp || params.speculative.has_stage_type(COMMON_SPECULATIVE_TYPE_MTP);
     cparams.mtp_op_type      = MTP_OP_NONE;

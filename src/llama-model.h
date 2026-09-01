@@ -303,6 +303,11 @@ struct llama_layer {
     struct ggml_tensor * ffn_up_exps  = nullptr;
     struct ggml_tensor * ffn_up_gate_exps  = nullptr;
 
+    // Phase 4 dynamic expert cache: resident per-layer slots (H+1 entries; index H = trash slot)
+    struct ggml_tensor * ffn_gate_exps_hot = nullptr;
+    struct ggml_tensor * ffn_down_exps_hot = nullptr;
+    struct ggml_tensor * ffn_up_exps_hot   = nullptr;
+
     llama_split_tensor split_ffn_gate_inp;
     llama_split_tensor split_ffn_up_exps;
     llama_split_tensor split_ffn_gate_exps;
@@ -566,6 +571,12 @@ struct llama_model {
 
     bool mtp; // use mtp if is supported by the Model
     bool swa_compress = false; // value the cache-size fit was computed with
+
+    // Phase 4 dynamic expert cache: slots per MoE layer (0 = off); resolved from
+    // expert_cache_gb at load when the latter is given. Slot tensors live on
+    // layers[].ffn_{up,gate,down}_exps_hot (H+1 entries each; index H = trash slot).
+    int32_t expert_cache_h = 0;
+    float   expert_cache_gb = 0.0f;
 
     std::vector<rpc_device> rpc_servers;
     std::vector<int32_t> devices;

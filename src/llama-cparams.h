@@ -36,6 +36,8 @@ struct llama_cparams {
     bool fused_moe_up_gate;
     bool grouped_expert_routing;
     bool expert_trace;
+    int32_t expert_cache_h;            // Phase 4: per-layer dynamic expert cache slots (0 = off)
+    float   expert_cache_promote_gbps; // Phase 4: promotion rate cap (GB/s, <=0 = unlimited)
     bool fused_up_gate;
     bool fused_mmad;
     bool rope_cache;

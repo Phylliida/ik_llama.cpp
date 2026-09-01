@@ -497,6 +497,11 @@ struct gpt_params {
     // MoE expert-usage tracing
     std::string expert_trace = "";  // if set, record exact per-token expert selections to this file
 
+    // Phase 4: dynamic LRU expert cache
+    int32_t expert_cache_h = 0;                 // per-MoE-layer resident expert slots; 0 = off
+    float   expert_cache_gb = 0.0f;             // alternative sizing by total byte budget
+    float   expert_cache_promote_gbps = 8.0f;   // promotion bandwidth cap (GB/s); <=0 = unlimited
+
     // embedding
     bool embedding         = false; // get only sentence embedding
     int32_t embd_normalize = 2;     // normalization for embeddings (-1=none, 0=max absolute int16, 1=taxicab, 2=euclidean, >2=p-norm)

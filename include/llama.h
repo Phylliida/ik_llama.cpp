@@ -376,6 +376,8 @@ extern "C" {
         int32_t main_gpu;
         int32_t max_gpu;
         int32_t ncmoe;
+        int32_t expert_cache_h;   // >0: allocate per-layer expert cache slot tensors (Phase 4) [EXPERIMENTAL]
+        float   expert_cache_gb;  // >0: alternative expert-cache sizing by total byte budget (resolved to expert_cache_h at load)
 
         enum ggml_type type_k;
         enum ggml_type type_v;
@@ -503,6 +505,8 @@ extern "C" {
         bool only_active_experts;
         bool prefetch_experts;  // if true, stream mmap'd MoE expert weights into the page cache (Linux only)
         int  prefetch_experts_threads; // number of expert prefetch workers (<=0 = auto)
+        int32_t expert_cache_h;       // >0: per-MoE-layer dynamic expert cache with this many resident slots (Phase 4) [EXPERIMENTAL]
+        float   expert_cache_promote_gbps; // expert cache promotion rate cap in GB/s (<=0 = unlimited) [EXPERIMENTAL]
         bool k_cache_hadamard;  // if true, apply Hadamard transform to K-cache
         bool v_cache_hadamard;  // if true, apply Hadamard transform to V-cache (needs FA)
         bool split_mode_graph_scheduling; // if true, force split mode graph scheduling
