@@ -1155,6 +1155,7 @@ static inline bool llama_kv_qnext_seq_id_in_range(const llama_kv_cache & cache, 
 static bool llama_mtp_tail_uses_layer_cache(const llama_model & model) {
     return model.hparams.nextn_predict_layers > 0 &&
         (model.arch == LLM_ARCH_GLM_DSA ||
+         model.arch == LLM_ARCH_GLM5NEXT ||
          model.arch == LLM_ARCH_QWEN35MOE ||
          model.arch == LLM_ARCH_STEP35);
 }
@@ -1354,7 +1355,10 @@ static bool llama_kv_cache_init(
     if (has_glm_dsa_indexer || has_openpangu_dsa_indexer || has_qwen4exp_indexer) {
         cache.kr_l.resize(n_layer, nullptr);
     }
-    if (has_qwen4exp_indexer) {
+    // (the MTP-only context never pools: its draft layer runs dense attention, and leaving
+    // kp_l empty there keeps the qsa_pooled_stale hooks from disabling draft graph reuse)
+    if (has_qwen4exp_indexer || (model.arch == LLM_ARCH_GLM5NEXT && cparams.dsa &&
+            cparams.mtp_op_type == MTP_OP_NONE)) {
         cache.kp_l.resize(n_layer, nullptr);
     }
 
@@ -1450,6 +1454,19 @@ static bool llama_kv_cache_init(
                 ggml_tensor * kr = ggml_new_tensor_2d(ctx, idx_type_k, idx_row, kv_size);
                 ggml_format_name(kr, "cache_kr_l%d", i);
                 cache.kr_l[i] = kr;
+                // GLM5NEXT k-pool indexer: one pooled key per block of indexer_block_size
+                // positions, pool-indexed (row b = pool b). F32 because the CPU ggml_set_rows
+                // used for the incremental repool only supports F32 destinations. Gated on the
+                // --dsa flag so dense runs keep an empty kp_l and never trip qsa_pooled_stale.
+                // MTP-only contexts skip it too: the draft layer runs dense attention.
+                if (model.arch == LLM_ARCH_GLM5NEXT && hparams.indexer_block_size > 0 && cparams.dsa &&
+                        cparams.mtp_op_type == MTP_OP_NONE) {
+                    const uint32_t r = hparams.indexer_block_size;
+                    ggml_tensor * kp = ggml_new_tensor_2d(ctx, GGML_TYPE_F32,
+                            hparams.indexer_head_size, (kv_size + r - 1)/r);
+                    ggml_format_name(kp, "cache_kp_l%d", i);
+                    cache.kp_l[i] = kp;
+                }
             }
             if (!cparams.flash_attn && cparams.mla_attn == 1) {
                 ggml_tensor * kvt = ggml_new_tensor_1d(ctx, cache.type_v, kv_lora_rank*kv_size);
@@ -5301,6 +5318,55 @@ static void llama_set_inputs(llama_context & lctx, const llama_batch & batch) {
                 }
             }
         }
+
+        // incremental repool window: which pools this graph (re)writes into kp_l. A narrow
+        // graph covers only the pools this ubatch's tokens touch; a stale cache (defrag, state
+        // restore, position shift) repools every complete pool once.
+        if (lctx.inp_kpool_win_blocks) {
+            GGML_ASSERT(ggml_backend_buffer_is_host(lctx.inp_kpool_win_blocks->buffer));
+            GGML_ASSERT(ggml_backend_buffer_is_host(lctx.inp_kpool_win_cells->buffer));
+
+            const int64_t n_win = lctx.inp_kpool_win_blocks->ne[0];
+            int32_t * dst_win_blocks = (int32_t *) lctx.inp_kpool_win_blocks->data;
+            int32_t * dst_win_cells  = (int32_t *) lctx.inp_kpool_win_cells->data;
+
+            std::vector<int32_t> touched;
+            touched.reserve(n_win);
+            if (lctx.qsa_pooled_stale) {
+                for (int64_t b = 0; b < n_pool; ++b) {
+                    if (filled[b] == (int32_t) r) {
+                        touched.push_back((int32_t) b);
+                    }
+                }
+            } else {
+                for (int64_t i = 0; i < n_tok && i < (int64_t) batch.n_tokens; ++i) {
+                    const int64_t b = batch.pos[i] / r;
+                    if (b < n_pool && std::find(touched.begin(), touched.end(), (int32_t) b) == touched.end()) {
+                        touched.push_back((int32_t) b);
+                    }
+                }
+            }
+            if (touched.empty()) {
+                touched.push_back(0);
+            }
+
+            for (int64_t w = 0; w < n_win; ++w) {
+                // a short window repeats its last entry, so the scatter writes the same
+                // correct value twice rather than an unrelated pool
+                const int32_t b = touched[std::min<size_t>((size_t) w, touched.size() - 1)];
+                dst_win_blocks[w] = b;
+                if (b < n_pool) {
+                    std::copy_n(dst_pool_cells + (int64_t) b * r, r, dst_win_cells + w * r);
+                } else {
+                    std::fill_n(dst_win_cells + w * r, r, 0);
+                }
+            }
+
+            // more distinct touched pools than the window covers -> the next graph must
+            // rebuild wide. Single-sequence ubatches span at most n_tok/r + 1 pools, so this
+            // only fires when even a wide rebuild could not cover every pool.
+            lctx.qsa_pooled_stale = (int64_t) touched.size() > n_win;
+        }
     }
 
     for (auto & qsa : lctx.inp_qsa) {
@@ -9085,6 +9151,7 @@ struct llama_context * llama_init_from_model(
     if (model->arch != LLM_ARCH_GLM4_MOE && model->arch != LLM_ARCH_QWEN35 &&
         model->arch != LLM_ARCH_QWEN35MOE && model->arch != LLM_ARCH_GEMMA4 &&
         model->arch != LLM_ARCH_GEMMA4_MTP && model->arch != LLM_ARCH_GLM_DSA &&
+        model->arch != LLM_ARCH_GLM5NEXT &&
         model->arch != LLM_ARCH_DEEPSEEK4 &&
         model->arch != LLM_ARCH_STEP35 &&
         model->arch != LLM_ARCH_GEMMA4_ASSISTANT &&
@@ -10465,6 +10532,12 @@ void llama_kv_cache_seq_add(struct llama_context * ctx, llama_seq_id seq_id, lla
     }
 
     llama_kv_cache_seq_add(ctx->kv_self, seq_id, p0, p1, delta);
+
+    // shifting positions re-keys every shifted pool (pool b = positions [b*r, (b+1)*r)), so
+    // the pooled indexer keys must be rebuilt from the raw ones
+    if (!ctx->kv_self.kp_l.empty()) {
+        ctx->qsa_pooled_stale = true;
+    }
 }
 
 void llama_kv_cache_seq_div(struct llama_context * ctx, llama_seq_id seq_id, llama_pos p0, llama_pos p1, int d) {
@@ -10473,6 +10546,11 @@ void llama_kv_cache_seq_div(struct llama_context * ctx, llama_seq_id seq_id, lla
     }
 
     llama_kv_cache_seq_div(ctx->kv_self, seq_id, p0, p1, d);
+
+    // same re-keying as seq_add above
+    if (!ctx->kv_self.kp_l.empty()) {
+        ctx->qsa_pooled_stale = true;
+    }
 }
 
 llama_pos llama_kv_cache_seq_pos_min(struct llama_context * ctx, llama_seq_id seq_id) {

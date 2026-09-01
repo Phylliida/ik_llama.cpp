@@ -64,7 +64,9 @@ static ggml_tensor * build_glm5next_dsa_top_k(
         ggml_tensor * pool_cells,     // I32 [kpool*n_pool]   — cell index of each pool member
         ggml_tensor * pool_bias,      // F32 [n_pool, n_tokens] — 0 if pool visible, else -inf
         ggml_tensor * tail_cells,     // I32 [kpool-1, n_tokens, 1, 1] or null — trailing incomplete pool
-        ggml_tensor * ape_slots) {    // I32 [kpool]          — identity [0..kpool-1]
+        ggml_tensor * ape_slots,      // I32 [kpool]          — identity [0..kpool-1]
+        ggml_tensor * win_blocks,     // I32 [n_win]          — pools this ubatch (re)pools into kp_l
+        ggml_tensor * win_cells) {    // I32 [kpool*n_win]    — member cells of those pools
     auto & lctx    = llm.lctx;
     auto & ctx0    = llm.ctx0;
     auto & hparams = llm.hparams;
@@ -110,16 +112,18 @@ static ggml_tensor * build_glm5next_dsa_top_k(
     auto all = ggml_view_2d(ctx0, kv_self.kr_l[il], 2 * d, n_kv, kr_row, 0);
     cb(all, "dsa_cached_all", il);
 
-    // ---- gather pool members: pool_cells indexes which cells belong to each pool ----
-    // pool_cells is 1D [r*n_pool]: membership depends on cache positions, shared across all query tokens
-    auto members = ggml_get_rows(ctx0, all, pool_cells);     // [2*d, r*n_pool]
-    members = ggml_reshape_3d(ctx0, members, 2 * d, r, n_pool);
+    // ---- gather the touched pools' members: win_cells indexes which cells belong to them ----
+    // A token's cached [key; gate] never changes once written, so only the pools this ubatch
+    // writes into need (re)pooling; every ubatch token retouches its own pool.
+    const int64_t n_win = win_blocks->ne[0];
+    auto members = ggml_get_rows(ctx0, all, win_cells);      // [2*d, r*n_win]
+    members = ggml_reshape_3d(ctx0, members, 2 * d, r, n_win);
     cb(members, "dsa_pool_members", il);
 
-    // split into keys [d, r, n_pool] and gates [d, r, n_pool] (packed along dim 0)
-    auto m_k = ggml_cont(ctx0, ggml_view_3d(ctx0, members, d, r, n_pool,
+    // split into keys [d, r, n_win] and gates [d, r, n_win] (packed along dim 0)
+    auto m_k = ggml_cont(ctx0, ggml_view_3d(ctx0, members, d, r, n_win,
             members->nb[1], members->nb[2], 0));
-    auto m_g = ggml_cont(ctx0, ggml_view_3d(ctx0, members, d, r, n_pool,
+    auto m_g = ggml_cont(ctx0, ggml_view_3d(ctx0, members, d, r, n_win,
             members->nb[1], members->nb[2], ggml_row_size(members->type, d)));
     cb(m_k, "dsa_pool_k", il);
     cb(m_g, "dsa_pool_g", il);
@@ -133,19 +137,19 @@ static ggml_tensor * build_glm5next_dsa_top_k(
     auto v = ggml_cont(ctx0, ggml_permute(ctx0, m_k, 1, 0, 2, 3));
     auto pooled = ggml_sum_rows(ctx0, ggml_mul(ctx0, v, w));
     pooled = ggml_cont(ctx0, ggml_permute(ctx0, pooled, 1, 0, 2, 3));
-    pooled = ggml_reshape_2d(ctx0, pooled, d, n_pool);
+    pooled = ggml_reshape_2d(ctx0, pooled, d, n_win);
+    if (pooled->type != GGML_TYPE_F32) {
+        // kp_l is F32: the CPU ggml_set_rows scatter only supports F32 sources
+        pooled = ggml_cast(ctx0, pooled, GGML_TYPE_F32);
+    }
     cb(pooled, "dsa_indexer_k_pooled", il);
 
-    // ---- indexer query (nope-only: no rope) ----
-    auto q = ggml_mul_mat(ctx0, layer.indexer_attn_q_b, qr);  // [d*nh, n_tok]
-    q = ggml_reshape_3d(ctx0, q, d, nh, n_tok);
-    cb(q, "dsa_indexer_q", il);
-
-    // relu(x*s) == s*relu(x) for s > 0, so both positive scalars fold into the weights
-    auto wts = ggml_mul_mat(ctx0, layer.indexer_proj, cur);  // [nh, n_tok]
-    wts = ggml_scale(ctx0, wts, 1.0f / sqrtf(float(d * nh)));
-    wts = ggml_reshape_3d(ctx0, wts, nh, 1, n_tok);
-    cb(wts, "dsa_indexer_weights", il);
+    // scatter the (re)pooled keys into the pool cache and read the full pool set back off the
+    // scatter's result, so the read depends on the write rather than merely following it
+    ggml_tensor * kp_all = ggml_set_rows(ctx0, kv_self.kp_l[il], pooled, win_blocks);
+    cb(kp_all, "dsa_kp_scatter", il);
+    pooled = ggml_view_2d(ctx0, kp_all, d, n_pool, kp_all->nb[1], 0);
+    cb(pooled, "dsa_kp_all", il);
 
     // ---- top-k over pools (cut on whole pools, never single cells) ----
     // reserve room for the tail (r-1 cells) so r*n_sel + (r-1) <= n_kv; dense fallback if the cache is too small
@@ -154,8 +158,23 @@ static ggml_tensor * build_glm5next_dsa_top_k(
             (int64_t) hparams.indexer_top_k / r,
             (n_kv - tail_cnt) / r});
     if (n_sel < 1) {
+        // the pooling above still had to run: it is the only chance these pools get to enter
+        // the cache. The scatter is no ancestor of any output on this path, so expand it here
+        ggml_build_forward_expand(gf, kp_all);
         return nullptr;  // cache too small for the indexer — dense attention over the few keys
     }
+
+    // ---- indexer query (nope-only: no rope) ----
+    auto q = ggml_mul_mat(ctx0, layer.indexer_attn_q_b, qr);  // [d*nh, n_tok]
+    q = ggml_reshape_3d(ctx0, q, d, nh, n_tok);
+    cb(q, "dsa_indexer_q", il);
+
+    // relu(x*s) == s*relu(x) for s > 0, so both positive scalars fold into the weights
+    auto wts = ggml_mul_mat(ctx0, layer.indexer_proj, cur);  // [nh, n_tok]
+    ggml_mul_mat_set_prec(wts, GGML_PREC_F32);
+    wts = ggml_scale(ctx0, wts, 1.0f / sqrtf(float(d * nh)));
+    wts = ggml_reshape_3d(ctx0, wts, nh, 1, n_tok);
+    cb(wts, "dsa_indexer_weights", il);
 
     // ---- score: relu(pooled . q), weighted by proj, summed over heads ----
     // chunk the score over the query dim to bound the [n_pool, nh, Tc] tensor
@@ -238,7 +257,9 @@ static ggml_tensor * build_glm5next_mla_attention(
         ggml_tensor * pool_cells    = nullptr,
         ggml_tensor * pool_bias     = nullptr,
         ggml_tensor * tail_cells    = nullptr,
-        ggml_tensor * ape_slots     = nullptr) {
+        ggml_tensor * ape_slots     = nullptr,
+        ggml_tensor * win_blocks    = nullptr,
+        ggml_tensor * win_cells     = nullptr) {
     auto & lctx    = llm.lctx;
     auto & ctx0    = llm.ctx0;
     auto & hparams = llm.hparams;
@@ -266,7 +287,8 @@ static ggml_tensor * build_glm5next_mla_attention(
     // Gate: --dsa flag + indexer tensors present + kpool > 0 + pool metadata created.
     ggml_tensor * top_k = nullptr;
     if (lctx.cparams.dsa && layer.indexer_attn_q_b && hparams.indexer_block_size > 0 && pool_cells) {
-        top_k = build_glm5next_dsa_top_k(llm, gf, il, cur, qr, pool_cells, pool_bias, tail_cells, ape_slots);
+        top_k = build_glm5next_dsa_top_k(llm, gf, il, cur, qr, pool_cells, pool_bias, tail_cells, ape_slots,
+                win_blocks, win_cells);
     }
 
     auto q = ggml_mul_mat(ctx0, layer.wq_b, qr);
@@ -378,6 +400,88 @@ static ggml_tensor * build_glm5next_mla_attention(
     return cur;
 }
 
+// NextN/MTP draft block (blk.n_layer-1): eh_proj(concat(enorm(tok_emb), hnorm(hidden))) → one
+// full DSA-layer block run DENSE (draft ubatches are 1 token; the k-pool indexer selection is
+// skipped, MLA attends over the whole cache) → MoE + shared expert → shared head. Plain
+// residuals — the NextN block has no mHC mixer. Mirrors build_deepseek2_mtp.
+static ggml_tensor * build_glm5next_mtp(
+        llm_build_context & llm,
+        const llama_layer & mtp_layer,
+        ggml_tensor * prev_embeddings,   // [n_embd, n_tokens] — trunk result_norm rows
+        ggml_cgraph * gf) {
+    auto & lctx    = llm.lctx;
+    auto & ctx0    = llm.ctx0;
+    auto & hparams = llm.hparams;
+    auto & model   = llm.model;
+    auto & cb      = llm.cb;
+
+    const int il = hparams.n_layer - 1;
+    const float kq_scale = 1.0f / sqrtf(float(hparams.n_embd_head_k_full));
+
+    ggml_tensor * KQ_mask = llm.build_inp_KQ_mask();
+    ggml_tensor * inp_out_ids = llm.n_tokens > 1 ? llm.build_inp_out_ids() : nullptr;
+
+    ggml_tensor * tok_w = mtp_layer.nextn.embed_tokens ? mtp_layer.nextn.embed_tokens : model.tok_embd;
+    ggml_tensor * token_emb = llm.build_inp_embd_mtp(tok_w);
+
+    if (mtp_layer.nextn.eh_proj == nullptr) {
+        GGML_ABORT("GLM5NEXT MTP requires nextn.eh_proj");
+    }
+    ggml_tensor * cur = llm.build_mtp_input(mtp_layer, prev_embeddings, token_emb, il, nullptr);
+
+    ggml_tensor * inpSA = cur;
+    cur = build_glm5next_mla_attention(llm, gf, il, cur, KQ_mask, kq_scale);  // dense: no pool metadata
+    ggml_tensor * ffn_inp = ggml_add(ctx0, cur, inpSA);
+    cb(ffn_inp, "mtp_ffn_inp", il);
+
+    if (inp_out_ids) {
+        ffn_inp = ggml_get_rows(ctx0, ffn_inp, inp_out_ids);
+    }
+
+    cur = llm_build_context::llm_build_norm(ctx0, ffn_inp, hparams, mtp_layer.ffn_norm, nullptr, LLM_NORM_RMS, cb, il);
+    cb(cur, "ffn_norm", il);
+
+    // MoE FFN (the NextN layer is in the MoE range) + shared expert
+    ggml_tensor * moe_out = llm_build_context::llm_build_moe_ffn(ctx0, lctx, cur,
+            mtp_layer.ffn_gate_inp, nullptr,
+            mtp_layer.ffn_up_exps, nullptr,
+            mtp_layer.ffn_gate_exps, nullptr,
+            mtp_layer.ffn_down_exps, nullptr,
+            mtp_layer.ffn_exp_probs_b,
+            llm.n_expert, llm.n_expert_used,
+            LLM_FFN_SILU, hparams.expert_weights_norm,
+            true, hparams.expert_weights_scale,
+            (llm_expert_gating_func_type) hparams.expert_gating_func,
+            cb, il, gf, false, mtp_layer.ffn_up_gate_exps, nullptr, nullptr, nullptr, nullptr);
+    cb(moe_out, "ffn_moe_out", il);
+
+    ggml_tensor * ffn_shexp = llm_build_context::llm_build_ffn(ctx0, lctx, nullptr, cur,
+            mtp_layer.ffn_up_shexp,   nullptr, nullptr,
+            mtp_layer.ffn_gate_shexp, nullptr, nullptr,
+            mtp_layer.ffn_down_shexp, nullptr, nullptr,
+            nullptr,
+            LLM_FFN_SILU, LLM_FFN_PAR, cb, il);
+    cb(ffn_shexp, "ffn_shexp", il);
+
+    cur = ggml_add(ctx0, moe_out, ffn_shexp);
+    cur = ggml_add(ctx0, cur, ffn_inp);
+    cur = lctx.cvec.apply_to(ctx0, cur, il);
+    cb(cur, "mtp_ffn_out_resid", il);
+
+    ggml_tensor * norm_w = mtp_layer.nextn.shared_head_norm ? mtp_layer.nextn.shared_head_norm : model.output_norm;
+    if (norm_w == nullptr) {
+        GGML_ABORT("GLM5NEXT MTP requires nextn.shared_head_norm or model output_norm");
+    }
+    cur = llm_build_context::llm_build_norm(ctx0, cur, hparams, norm_w, nullptr, LLM_NORM_RMS, cb, il);
+    cb(cur, "result_norm", -1);
+
+    ggml_tensor * head_w = mtp_layer.nextn.shared_head_head ? mtp_layer.nextn.shared_head_head : model.output;
+    cur = llm_build_context::llm_build_lora_mm(lctx, ctx0, head_w, cur);
+    cb(cur, "result_output", -1);
+
+    return cur;
+}
+
 ggml_cgraph * llm_build_context::build_glm5next() {
     ggml_cgraph * gf = new_graph_custom();
 
@@ -385,6 +489,18 @@ ggml_cgraph * llm_build_context::build_glm5next() {
 
     // NoPE: no YaRN mscale correction
     const float kq_scale = 1.0f / sqrtf(float(hparams.n_embd_head_k_full));
+
+    // MTP draft context: run only the NextN tail layer and return (mirrors build_deepseek2)
+    if (cparams.mtp_op_type != MTP_OP_NONE) {
+        if (!model.mtp || hparams.nextn_predict_layers == 0) {
+            GGML_ABORT("GLM5NEXT MTP tail requires NextN layers (run the main model with MTP enabled)");
+        }
+        ggml_tensor * hidden_states_from_main_model = build_inp_mtp_states(hparams.n_embd);
+        const int il_mtp = hparams.n_layer - 1;
+        ggml_tensor * cur = build_glm5next_mtp(*this, model.layers[il_mtp], hidden_states_from_main_model, gf);
+        ggml_build_forward_expand(gf, cur);
+        return gf;
+    }
 
     delta_net delta(lctx, batch);
 
@@ -403,6 +519,8 @@ ggml_cgraph * llm_build_context::build_glm5next() {
     ggml_tensor * pool_bias  = nullptr;
     ggml_tensor * tail_cells = nullptr;
     ggml_tensor * ape_slots  = nullptr;
+    ggml_tensor * win_blocks = nullptr;
+    ggml_tensor * win_cells  = nullptr;
     const bool use_dsa = lctx.cparams.dsa
         && hparams.indexer_head_size > 0
         && hparams.indexer_block_size > 0
@@ -421,6 +539,20 @@ ggml_cgraph * llm_build_context::build_glm5next() {
             lctx.inp_kpool_cells     = pool_cells;
             lctx.inp_kpool_bias      = pool_bias;
             lctx.inp_kpool_ape_slots = ape_slots;
+            // incremental repool window: only the pools this ubatch touches get pooled again,
+            // unless the pooled cache is stale (defrag/restore/shift), which takes the full
+            // window once. n_tokens consecutive positions span n_tokens/r pools, plus one
+            // when the run straddles a pool boundary.
+            const int64_t n_win = lctx.qsa_pooled_stale ? n_pool
+                    : std::min<int64_t>(n_pool, (n_tokens + r - 1)/r + 1);
+            win_blocks = ggml_new_tensor_1d(ctx0, GGML_TYPE_I32, n_win);
+            win_cells  = ggml_new_tensor_1d(ctx0, GGML_TYPE_I32, r * n_win);
+            ggml_set_input(win_blocks);
+            ggml_set_input(win_cells);
+            lctx.inp_kpool_win_blocks = win_blocks;
+            lctx.inp_kpool_win_cells  = win_cells;
+            cb(win_blocks, "inp_kpool_win_blocks", -1);
+            cb(win_cells,  "inp_kpool_win_cells",  -1);
             if (r > 1) {
                 // trailing incomplete pool cells: [kpool-1, n_tokens] (per-query)
                 tail_cells = ggml_new_tensor_2d(ctx0, GGML_TYPE_I32, r - 1, n_tokens);
@@ -463,7 +595,7 @@ ggml_cgraph * llm_build_context::build_glm5next() {
             // NoPE absorbed MLA (applies attn_norm internally; no residual — mHC handles it).
             // When --dsa is active, the indexer builds a sparse top-k mask; else dense.
             cur = build_glm5next_mla_attention(*this, gf, il, cur, KQ_mask, kq_scale,
-                    pool_cells, pool_bias, tail_cells, ape_slots);
+                    pool_cells, pool_bias, tail_cells, ape_slots, win_blocks, win_cells);
         }
 
         inpL = build_mhc_post(cur, post_attn, residual_attn, comb_attn, n_embd, hc, true);
@@ -526,11 +658,14 @@ ggml_cgraph * llm_build_context::build_glm5next() {
         cb(inpL, "l_out", il);
     }
 
-    // collapse the hc streams for the head (unweighted mean; GLM-5.3-Flash has no head mHC), then
-    // inp_out_ids to skip unused output tokens
+    // collapse the hc streams for the head (unweighted mean; GLM-5.3-Flash has no head mHC).
+    // With MTP on, keep ALL tokens: the draft context consumes every token's normed hidden
+    // state (result_norm), so the inp_out_ids reduction is skipped (mirrors build_deepseek2).
     {
         auto flat = ggml_reshape_2d(ctx0, inpL, n_embd * hc, n_tokens);
-        flat = ggml_get_rows(ctx0, flat, inp_out_ids);
+        if (!lctx.cparams.mtp) {
+            flat = ggml_get_rows(ctx0, flat, inp_out_ids);
+        }
         const int64_t n_out = flat->ne[1];
         // sum the hc streams
         ggml_tensor * summed = nullptr;

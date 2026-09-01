@@ -300,6 +300,30 @@ struct llama_mmap::impl {
         }
         if (prefetch) { flags |= MAP_POPULATE; }
         if (use_thp) {
+            // anonymous mapping + MADV_HUGEPAGE: transparent huge pages without reserved
+            // hugepages (works with /sys/kernel/mm/transparent_hugepage/enabled = madvise)
+            addr = mmap(nullptr, file->size(), PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+            if (addr != MAP_FAILED && madvise(addr, file->size(), MADV_HUGEPAGE) == 0) {
+                printf("%s: using transparent huge pages (madvise) ", __func__);
+                fflush(stdout);
+                size_t tot = 0;
+                while (tot < file->size()) {
+                    auto n_read = pread(fd, static_cast<char*>(addr) + tot, file->size() - tot, tot);
+                    if (n_read < 0) throw std::runtime_error(format("Reading into mapped huge pages failed at %zu (%s)", tot, strerror(errno)));
+                    printf(".");  fflush(stdout);
+                    tot += n_read;
+                    // drop the page cache behind us: anon pages + full file cache would exceed RAM
+                    posix_fadvise(fd, tot, 0, POSIX_FADV_DONTNEED);
+                }
+                printf(" done\n");
+                mapped_fragments.emplace_back(0, file->size());
+                mapped_page_size = 2*1024*1024; // for dontneed_fragment alignment
+                return;
+            }
+            if (addr != MAP_FAILED) {
+                munmap(addr, file->size());
+                addr = nullptr;
+            }
             size_t huge = get_default_huge_page_size();
             auto size = huge*((file->size() + huge - 1)/huge);
             addr = mmap(nullptr, size, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS | MAP_HUGETLB, -1, 0);
@@ -380,6 +404,11 @@ struct llama_mmap::impl {
     }
 
     void dontneed_fragment(size_t first, size_t last) {
+        if (mapped_page_size > 0) {
+            // THP/hugetlb mappings are anonymous copies (the only residence of the data);
+            // MADV_DONTNEED on them would zero the weights, not drop file cache.
+            return;
+        }
         int page_size = mapped_page_size > 0 ? mapped_page_size : sysconf(_SC_PAGESIZE);
         align_range(&first, &last, page_size);
         size_t len = last - first;

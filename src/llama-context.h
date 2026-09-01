@@ -645,6 +645,8 @@ struct llama_context {
     struct ggml_tensor * inp_kpool_bias      = nullptr; // F32 [n_pool, n_tokens] 0 if pool complete & visible to query, else -inf
     struct ggml_tensor * inp_kpool_tail      = nullptr; // I32 [kpool-1, n_tokens] trailing incomplete pool cells (null when kpool==1)
     struct ggml_tensor * inp_kpool_ape_slots = nullptr; // I32 [kpool] identity [0..kpool-1], gathers the ape rows in order
+    struct ggml_tensor * inp_kpool_win_blocks = nullptr; // I32 [n_win] pools this ubatch (re)pools into kp_l
+    struct ggml_tensor * inp_kpool_win_cells  = nullptr; // I32 [kpool*n_win] member cells of those pools
 
     // Qwen sparse attention: everything that depends on cache layout is computed on the host,
     // so the graph only gathers, pools and scores. One entry per distinct compress ratio.
