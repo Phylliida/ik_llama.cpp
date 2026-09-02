@@ -26499,6 +26499,10 @@ static int ggml_compute_forward(struct ggml_compute_params * params, struct ggml
         const char * e = getenv("IK_DISABLE_ROUTER_FUSION");
         ik_router_fusion_disabled = e && atoi(e) != 0;
     }
+    static int ik_log_fusion = -1;
+    if (ik_log_fusion < 0) {
+        ik_log_fusion = getenv("IK_LOG_FUSION") != NULL;
+    }
 
     switch (tensor->op) {
         case GGML_OP_REDUCE:
@@ -26953,6 +26957,7 @@ static int ggml_compute_forward(struct ggml_compute_params * params, struct ggml
                     cgraph->nodes[i+3]->op == GGML_OP_ARGSORT &&
                     cgraph->nodes[i+4]->op == GGML_OP_VIEW &&
                     cgraph->nodes[i+5]->op == GGML_OP_GET_ROWS) {
+                    if (ik_log_fusion && params->ith == 0) fprintf(stderr, "IKFUSION glm45 at node %d (%s) of %d\n", i, tensor->name, cgraph->n_nodes);
                     iqk_glm45moe_experts(cgraph->nodes[i+5], cgraph->nodes[i+4], params->ith, params->nth);
                     i += 5;
                 }

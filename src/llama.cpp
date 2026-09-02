@@ -6770,21 +6770,31 @@ static int llama_expert_trace_snap_cb(ggml_tensor * t, bool ask, void * user_dat
 // -------------------------------------------------------------------------
 // Phase 4 dynamic expert cache: classify step.
 //
-// After each MoE layer's ffn_moe_topk-N node computes, map the routed expert
-// ids through the layer's remap table and program the three mask inputs of the
-// current graph (hot_ids / hot_mask / cold_ids). The scheduler synchronizes the
-// producing backend before invoking us with ask=false (need == 1), so tensor
-// reads are safe; writes land before the consuming expert nodes start.
+// After each MoE layer's ffn_moe_weights-N node (the router get_rows) computes,
+// map the routed expert ids through the layer's remap table and program the
+// three mask inputs of the current graph (hot_ids / hot_mask / cold_ids). The
+// scheduler synchronizes the producing backend before invoking us with
+// ask=false (need == 1), so tensor reads are safe; writes land before the
+// consuming expert nodes start.
+//
+// The trigger is deliberately the get_rows node, NOT the ffn_moe_topk-N view:
+// the glm45 router fusion pattern [SIGMOID, RESHAPE, ADD, ARGSORT, VIEW,
+// GET_ROWS] must sit inside one scheduler range to fire; cutting at the topk
+// view splits it (the range ends before GET_ROWS), silently switching cache-on
+// runs to the unfused router path and perturbing near-tie expert selection vs
+// a cache-off baseline (M1 CPU-gate divergence, root-caused 2026-09-02). The
+// fused kernel writes the top-k ids into the argsort parent before the view or
+// get_rows execute, so reading the ids at the get_rows trigger is always fresh.
 static int llama_expert_cache_eval_cb(ggml_tensor * t, bool ask, void * user_data) {
     llama_context * lctx = (llama_context *) user_data;
     const auto & cache = lctx->expert_cache;
     if (!cache) {
         return ask ? 0 : 1;
     }
-    if (strncmp(t->name, "ffn_moe_topk-", 13) != 0) {
+    if (strncmp(t->name, "ffn_moe_weights-", 16) != 0) {
         return ask ? 0 : 1;
     }
-    const char * p = t->name + 13;
+    const char * p = t->name + 16;
     int32_t il = 0;
     while (*p >= '0' && *p <= '9') {
         il = 10*il + (*p - '0');
@@ -6822,9 +6832,14 @@ static int llama_expert_cache_eval_cb(ggml_tensor * t, bool ask, void * user_dat
     if (!hot_ids || !hot_mask || !cold_ids) {
         return 1; // current graph was built without cache inputs for this layer
     }
-    const int64_t k    = t->ne[0];
-    const int64_t ntok = t->ne[1];
-    if (t->type != GGML_TYPE_I32 || k <= 0 || ntok <= 0) {
+    // the trigger is the router get_rows; its src[1] is the top-k id view
+    ggml_tensor * tk = (t->op == GGML_OP_GET_ROWS && t->src[1]) ? t->src[1] : nullptr;
+    if (!tk) {
+        return 1;
+    }
+    const int64_t k    = tk->ne[0];
+    const int64_t ntok = tk->ne[1];
+    if (tk->type != GGML_TYPE_I32 || k <= 0 || ntok <= 0) {
         return 1;
     }
     if (hot_ids->ne[0] != k || hot_ids->ne[1] != ntok || cold_ids->ne[0] != k || cold_ids->ne[1] != ntok ||
@@ -6840,11 +6855,11 @@ static int llama_expert_cache_eval_cb(ggml_tensor * t, bool ask, void * user_dat
     // read back the ids, honoring the actual row pitch (same convention as the tracer)
     const size_t col_bytes = (size_t) k * sizeof(int32_t);
     std::vector<int32_t> ids((size_t) k * ntok);
-    if (t->nb[1] == col_bytes) {
-        ggml_backend_tensor_get(t, ids.data(), 0, (size_t) k * ntok * sizeof(int32_t));
+    if (tk->nb[1] == col_bytes) {
+        ggml_backend_tensor_get(tk, ids.data(), 0, (size_t) k * ntok * sizeof(int32_t));
     } else {
         for (int64_t c = 0; c < ntok; c++) {
-            ggml_backend_tensor_get(t, ids.data() + (size_t) c * k, (size_t) c * t->nb[1], col_bytes);
+            ggml_backend_tensor_get(tk, ids.data() + (size_t) c * k, (size_t) c * tk->nb[1], col_bytes);
         }
     }
 
