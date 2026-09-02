@@ -5198,6 +5198,15 @@ GGML_CALL static bool ggml_backend_cuda_offload_op(ggml_backend_t backend, const
     // as the condition for offloading model weights residing in RAM to the GPU.
     // In this case, the number of tokens is not as usual in op->ne[1] but rather in op->ne[2].
     if (op->op == GGML_OP_MUL_MAT_ID || op->op == GGML_OP_MOE_FUSED_UP_GATE) {
+        // Phase 4 expert-cache slot tensors ("blk.N.ffn_*_exps.hot"): their residency is
+        // managed by the cache. When they are host-resident (M1 / fallback), offloading
+        // the op here would dereference host ids/weights in-kernel (illegal access);
+        // the small slot count (H+1) also flips the heuristic below into firing at
+        // ordinary PP batch sizes. Never offload them. (Device-resident slots are
+        // assigned to this backend directly by the scheduler, bypassing offload.)
+        if (strstr(op->src[0]->name, "_exps.hot") != nullptr) {
+            return false;
+        }
         if (ctx->offload_batch_size_per_byte >= 0) {
             auto src0 = op->src[0];
             auto row_size = ggml_row_size(src0->type, src0->ne[0]);

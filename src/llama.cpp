@@ -4399,6 +4399,96 @@ static bool llm_load_tensors(
         model.buft_layer[i] = llama_default_buffer_type_cpu(true);
     }
 
+    // Phase 4: dynamic expert cache — resolve H and slot-buffer placement EARLY, so the
+    // device-memory accounting below (and auto-fit) sees the VRAM carve. Eligibility is
+    // collected from GGUF meta here and re-verified per layer when the slot tensors are
+    // created at the end of load (tensors do not exist yet at this point).
+    model.expert_cache_layers.clear();
+    model.expert_cache_device = -1;
+    model.expert_cache_bytes  = 0;
+    if ((model.expert_cache_h > 0 || model.expert_cache_gb > 0) && !dry_run) {
+        if (model.expert_cache_h > 0 && model.expert_cache_gb > 0) {
+            throw std::runtime_error("use only one of --expert-cache / --expert-cache-gb");
+        }
+        auto disable = [&](const char * why) {
+            LLAMA_LOG_WARN("%s: --expert-cache: %s; disabling\n", __func__, why);
+            model.expert_cache_h = 0; model.expert_cache_gb = 0;
+            model.expert_cache_layers.clear();
+        };
+        if (!ml.use_mmap && ml.repack_tensors) {
+            disable("incompatible with repacked tensors");
+        }
+        if ((model.expert_cache_h > 0 || model.expert_cache_gb > 0) && ml.merge_up_gate_exps) {
+            disable("incompatible with merged up/gate expert tensors");
+        }
+        if ((model.expert_cache_h > 0 || model.expert_cache_gb > 0) && ml.defer_experts) {
+            disable("incompatible with deferred expert loading");
+        }
+        if (model.expert_cache_h > 0 || model.expert_cache_gb > 0) {
+            double   bytes_per_slot_all = 0;
+            int64_t  n_expert = 0;
+            for (int il = 0; il < n_layer; il++) {
+                char name[128];
+                auto get_meta = [&](const char * what) -> const ggml_tensor * {
+                    snprintf(name, sizeof(name), "blk.%d.ffn_%s_exps.weight", il, what);
+                    return ml.get_tensor_meta(name);
+                };
+                auto * up      = get_meta("up");
+                auto * gate    = get_meta("gate");
+                auto * down    = get_meta("down");
+                auto * up_gate = get_meta("up_gate");
+                if (!up || !gate || !down || up_gate) {
+                    continue;
+                }
+                if (up->ne[2] != gate->ne[2] || up->ne[2] != down->ne[2] || up->type != gate->type) {
+                    continue;
+                }
+                if (n_expert == 0) {
+                    n_expert = up->ne[2];
+                }
+                if (up->ne[2] != n_expert) {
+                    continue; // require a uniform expert count (e.g. MTP tail layers may differ)
+                }
+                model.expert_cache_layers.push_back(il);
+                bytes_per_slot_all += (ggml_nbytes(up) + ggml_nbytes(gate) + ggml_nbytes(down)) / (double) up->ne[2];
+            }
+            if (model.expert_cache_layers.empty()) {
+                disable("no eligible MoE layers (separate up/gate/down tensors)");
+            } else {
+                // resolve --expert-cache-gb to a uniform slot count from real tensor sizes
+                if (model.expert_cache_gb > 0) {
+                    model.expert_cache_h = (int32_t) (model.expert_cache_gb * (double) (1 << 30) / bytes_per_slot_all);
+                    LLAMA_LOG_INFO("%s: --expert-cache-gb %.2f -> H=%d slots/layer (%.2f MB/slice, %zu layers)\n", __func__,
+                            (double) model.expert_cache_gb, model.expert_cache_h, bytes_per_slot_all / 1048576.0, model.expert_cache_layers.size());
+                }
+                if (model.expert_cache_h > n_expert - 1) {
+                    LLAMA_LOG_WARN("%s: clamping expert cache H %d -> %d (n_expert=%d)\n", __func__,
+                            model.expert_cache_h, (int) n_expert - 1, (int) n_expert);
+                    model.expert_cache_h = n_expert - 1;
+                }
+                if (model.expert_cache_h <= 0) {
+                    disable("expert cache budget too small");
+                }
+            }
+            if (model.expert_cache_h > 0) {
+                const int64_t H = model.expert_cache_h;
+                model.expert_cache_bytes = (size_t) llround(bytes_per_slot_all * (H + 1));
+                // placement: first offload device (CUDA0) unless this is a pure-CPU run or
+                // IK_EXP_CACHE_HOST forces pinned-host slots (M1 behavior, kept for A/B)
+                bool want_gpu = n_gpu_layers > 0 && !model.devices.empty() && !getenv("IK_EXP_CACHE_HOST");
+                if (want_gpu) {
+                    auto buft = model.default_buffer_type_offload(model.devices[0]);
+                    if (buft && !ggml_backend_buft_is_host(buft)) {
+                        model.expert_cache_device = 0;
+                    }
+                }
+                LLAMA_LOG_INFO("%s: expert cache: H=%d slots/layer x %zu layers, %.2f MiB, target %s\n", __func__,
+                        (int) H, model.expert_cache_layers.size(), model.expert_cache_bytes / 1048576.0,
+                        model.expert_cache_device >= 0 ? "GPU" : "host");
+            }
+        }
+    }
+
     std::vector<size_t> device_mem(model.devices.size());
     for (int i = 0; i < int(device_mem.size()); ++i) {
         device_mem[i] = llama_get_device_memory(model, model.devices[i]);
@@ -4408,6 +4498,23 @@ static bool llm_load_tensors(
         } else {
             LLAMA_LOG_WARN("Free memory %zu MiB on device %d is less the %zu MiB safety margin\n", device_mem[i]/(1024*1024), model.devices[i], this_margin/(1024*1024));
             device_mem[i] = 0;
+        }
+    }
+
+    // Phase 4: carve the expert-cache slot buffer from its target device, so the
+    // split/auto-fit accounting below reflects it (the buffer itself is allocated
+    // at the end of load). Fall back to host slots if it cannot possibly fit.
+    if (model.expert_cache_bytes > 0 && model.expert_cache_device >= 0 &&
+        model.expert_cache_device < (int) device_mem.size()) {
+        size_t & dmem = device_mem[model.expert_cache_device];
+        if (dmem >= model.expert_cache_bytes) {
+            dmem -= model.expert_cache_bytes;
+            LLAMA_LOG_INFO("%s: reserved %.2f MiB on device %d for the expert cache\n", __func__,
+                    model.expert_cache_bytes / 1048576.0, model.devices[model.expert_cache_device]);
+        } else {
+            LLAMA_LOG_WARN("%s: expert cache (%.2f MiB) exceeds free memory on device %d (%zu MiB); using host slots\n",
+                    __func__, model.expert_cache_bytes / 1048576.0, model.devices[model.expert_cache_device], dmem / (1024*1024));
+            model.expert_cache_device = -1;
         }
     }
 
@@ -5021,54 +5128,27 @@ static bool llm_load_tensors(
 
     // Phase 4: dynamic expert cache — allocate and fill the per-layer resident slot
     // tensors (ffn_{up,gate,down}_exps_hot), H+1 expert slots each (slot H = trash).
-    // Slicing is a contiguous memcpy: the expert index is the last tensor dim.
-    if ((model.expert_cache_h > 0 || model.expert_cache_gb > 0) && !dry_run) {
-        if (model.expert_cache_h > 0 && model.expert_cache_gb > 0) {
-            throw std::runtime_error("use only one of --expert-cache / --expert-cache-gb");
-        }
-        if (!ml.use_mmap && ml.repack_tensors) {
-            LLAMA_LOG_WARN("%s: --expert-cache is incompatible with repacked tensors; disabling cache\n", __func__);
-            model.expert_cache_h = 0; model.expert_cache_gb = 0;
-        }
-        // collect cacheable layers: separate up/gate/down expert tensors, no merged variant
+    // H, the candidate layer list, placement and the VRAM carve were resolved early in
+    // load (before device-memory accounting); here we only create and fill the tensors.
+    // Slicing is a contiguous copy: the expert index is the last tensor dim.
+    if (model.expert_cache_h > 0 && !dry_run) {
+        const int64_t H = model.expert_cache_h;
+        // re-verify runtime eligibility against the created tensors (in principle a
+        // meta-based candidate could be lost to a tensor transform at creation)
         std::vector<int> cache_layers;
-        for (int il = 0; il < (int) model.layers.size(); il++) {
+        for (int il : model.expert_cache_layers) {
             const auto & layer = model.layers[il];
             if (layer.ffn_up_exps && layer.ffn_gate_exps && layer.ffn_down_exps && !layer.ffn_up_gate_exps) {
                 cache_layers.push_back(il);
+            } else {
+                LLAMA_LOG_WARN("%s: layer %d lost expert-cache eligibility at tensor creation; skipping\n", __func__, il);
             }
         }
-        if (cache_layers.empty() && (model.expert_cache_h > 0 || model.expert_cache_gb > 0)) {
-            LLAMA_LOG_WARN("%s: --expert-cache: no eligible MoE layers (separate up/gate/down tensors); disabling\n", __func__);
-            model.expert_cache_h = 0; model.expert_cache_gb = 0;
-        }
-        if (!cache_layers.empty()) {
-            // resolve --expert-cache-gb to a uniform slot count from real tensor sizes
-            if (model.expert_cache_gb > 0) {
-                double bytes_per_slot_all = 0;
-                for (int il : cache_layers) {
-                    const auto & layer = model.layers[il];
-                    const int64_t ne2 = layer.ffn_up_exps->ne[2];
-                    bytes_per_slot_all += (ggml_nbytes(layer.ffn_up_exps)   + ggml_nbytes(layer.ffn_gate_exps) +
-                                           ggml_nbytes(layer.ffn_down_exps)) / (double) ne2;
-                }
-                model.expert_cache_h = (int32_t) (model.expert_cache_gb * (double) (1 << 30) / bytes_per_slot_all);
-                LLAMA_LOG_INFO("%s: --expert-cache-gb %.2f -> H=%d slots/layer (%.2f MB/slice, %zu layers)\n", __func__,
-                        (double) model.expert_cache_gb, model.expert_cache_h, bytes_per_slot_all / 1048576.0, cache_layers.size());
-            }
-            const int64_t n_expert = model.layers[cache_layers[0]].ffn_up_exps->ne[2];
-            if (model.expert_cache_h > n_expert - 1) {
-                LLAMA_LOG_WARN("%s: clamping expert cache H %d -> %d (n_expert=%d)\n", __func__,
-                        model.expert_cache_h, (int) n_expert - 1, (int) n_expert);
-                model.expert_cache_h = n_expert - 1;
-            }
-            if (model.expert_cache_h <= 0) {
-                LLAMA_LOG_WARN("%s: expert cache budget too small (H=%d); disabling\n", __func__, model.expert_cache_h);
-                model.expert_cache_h = 0;
-            }
+        if (cache_layers.empty()) {
+            LLAMA_LOG_WARN("%s: --expert-cache: no eligible MoE layers at tensor creation; disabling\n", __func__);
+            model.expert_cache_h = 0;
         }
         if (model.expert_cache_h > 0) {
-            const int64_t H = model.expert_cache_h;
             struct ggml_init_params ip = {
                 /*.mem_size   =*/ ggml_tensor_overhead() * 3 * cache_layers.size(),
                 /*.mem_buffer =*/ NULL,
@@ -5089,8 +5169,21 @@ static bool llm_load_tensors(
                 layer.ffn_gate_exps_hot = mk(layer.ffn_gate_exps, "gate");
                 layer.ffn_down_exps_hot = mk(layer.ffn_down_exps, "down");
             }
-            // M1: pinned host buffer (same buft as -ot exps=CPU); M2 moves this to CUDA0
-            ggml_backend_buffer_type_t buft = llama_default_buffer_type_cpu(true);
+            // placement: target offload device (M2) or pinned host (M1 / fallback)
+            ggml_backend_buffer_type_t buft = nullptr;
+            if (model.expert_cache_device >= 0 && model.expert_cache_device < (int) model.devices.size()) {
+                buft = model.default_buffer_type_offload(model.devices[model.expert_cache_device]);
+                if (buft && ggml_backend_buft_is_host(buft)) {
+                    buft = nullptr;
+                }
+            }
+            if (!buft) {
+                if (model.expert_cache_device >= 0) {
+                    LLAMA_LOG_WARN("%s: no device buffer type for the expert cache; using host slots\n", __func__);
+                    model.expert_cache_device = -1;
+                }
+                buft = llama_default_buffer_type_cpu(true);
+            }
             ggml_backend_buffer_t buf = ggml_backend_alloc_ctx_tensors_from_buft(ectx, buft);
             if (!buf) {
                 throw std::runtime_error("failed to allocate expert cache buffer");
@@ -5101,6 +5194,7 @@ static bool llm_load_tensors(
 
             // static dummy content: slot s <- expert s (s < H); trash slot H <- expert 0
             // (any valid quantized data works; content is managed dynamically from M3 on)
+            const bool dst_host = ggml_backend_buffer_is_host(buf);
             std::vector<uint8_t> scratch;
             for (int il : cache_layers) {
                 auto & layer = model.layers[il];
@@ -5110,16 +5204,22 @@ static bool llm_load_tensors(
                     const size_t dst_esize = dst->nb[2];
                     GGML_ASSERT(dst_esize >= src_esize);
                     GGML_ASSERT(src->type == dst->type && src->ne[0] == dst->ne[0] && src->ne[1] == dst->ne[1]);
+                    const bool src_host = ggml_backend_buffer_is_host(src->buffer);
                     for (int64_t s = 0; s <= H; s++) {
                         const int64_t e = s < H ? s : 0;
                         GGML_ASSERT(e < n_src_e);
-                        char * dptr = (char *) dst->data + s * dst_esize;
-                        if (ggml_backend_buffer_is_host(src->buffer)) {
-                            memcpy(dptr, (const char *) src->data + e * src_esize, src_esize);
-                        } else {
+                        const size_t src_off = (size_t) e * src_esize;
+                        const size_t dst_off = (size_t) s * dst_esize;
+                        const char * src_ptr = (const char *) src->data + src_off;
+                        if (!src_host) {
                             scratch.resize(src_esize);
-                            ggml_backend_tensor_get(src, scratch.data(), e * src_esize, src_esize);
-                            memcpy(dptr, scratch.data(), src_esize);
+                            ggml_backend_tensor_get(src, scratch.data(), src_off, src_esize);
+                            src_ptr = (const char *) scratch.data();
+                        }
+                        if (dst_host) {
+                            memcpy((char *) dst->data + dst_off, src_ptr, src_esize);
+                        } else {
+                            ggml_backend_tensor_set(dst, src_ptr, dst_off, src_esize);
                         }
                     }
                 };
@@ -9335,11 +9435,14 @@ struct llama_context * llama_init_from_model(
         const int32_t H = model->expert_cache_h;
         ctx->expert_cache = std::make_unique<llama_context::expert_cache_state>();
         ctx->expert_cache->h = H;
-        ctx->expert_cache->slots_on_cuda = false; // M1: slot tensors are pinned host memory
         for (int il = 0; il < (int) model->layers.size(); il++) {
             const auto & layer = model->layers[il];
             if (!layer.ffn_up_exps_hot) {
                 continue;
+            }
+            // placement decided at load (M2: CUDA0 slot buffer; M1/fallback: pinned host)
+            if (layer.ffn_up_exps_hot->buffer) {
+                ctx->expert_cache->slots_on_cuda = !ggml_backend_buffer_is_host(layer.ffn_up_exps_hot->buffer);
             }
             const int32_t n_expert = layer.ffn_up_exps->ne[2];
             auto & cl = ctx->expert_cache->layers[il];
@@ -9351,8 +9454,8 @@ struct llama_context * llama_init_from_model(
             }
         }
         ctx->expert_cache_pending = true; // callback installed after params.cb_eval is copied below
-        LLAMA_LOG_INFO("%s: expert cache active: H=%d, %zu layers (static dummy assignment)\n", __func__,
-                H, ctx->expert_cache->layers.size());
+        LLAMA_LOG_INFO("%s: expert cache active: H=%d, %zu layers (static dummy assignment, slots on %s)\n", __func__,
+                H, ctx->expert_cache->layers.size(), ctx->expert_cache->slots_on_cuda ? "GPU" : "host");
     }
 
     cparams.k_cache_hadamard = params.k_cache_hadamard;

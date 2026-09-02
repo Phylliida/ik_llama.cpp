@@ -577,6 +577,12 @@ struct llama_model {
     // layers[].ffn_{up,gate,down}_exps_hot (H+1 entries each; index H = trash slot).
     int32_t expert_cache_h = 0;
     float   expert_cache_gb = 0.0f;
+    // resolved early in llm_load_tensors (before device memory accounting):
+    // eligible layers, slot-buffer placement (index into devices[], -1 = pinned
+    // host) and total buffer bytes (carved from the target device's free memory).
+    std::vector<int> expert_cache_layers;
+    int32_t expert_cache_device = -1;
+    size_t  expert_cache_bytes  = 0;
 
     std::vector<rpc_device> rpc_servers;
     std::vector<int32_t> devices;
