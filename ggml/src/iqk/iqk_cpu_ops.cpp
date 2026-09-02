@@ -112,7 +112,7 @@ inline void biased_sigmoid(int n, const float * x, const float * bias, float * y
 #endif
     for (; i < n; ++i) {
         z[i] = 1/(1 + expf(-x[i]));
-        y[i] = y[i] + bias[i];
+        y[i] = z[i] + bias[i];
     }
 }
 inline void biased_sigmoid(int n, const float * x, const float * bias, float * y) {

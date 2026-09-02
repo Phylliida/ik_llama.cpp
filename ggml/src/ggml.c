@@ -26490,6 +26490,16 @@ static int ggml_compute_forward(struct ggml_compute_params * params, struct ggml
 
     const bool fusion = true;
 
+    // The MoE-router fusion patterns below (SIGMOID -> ... -> GROUPED_TOPK/ARGSORT) change
+    // router numerics (vectorized v_expf sigmoid vs scalar expf) and fire depending on graph
+    // node order, which the expert-cache two-path MoE fork perturbs. Allow disabling just the
+    // router fusion for bitwise base-vs-cache parity checks (M1 gate, Phase 4).
+    static int ik_router_fusion_disabled = -1;
+    if (ik_router_fusion_disabled < 0) {
+        const char * e = getenv("IK_DISABLE_ROUTER_FUSION");
+        ik_router_fusion_disabled = e && atoi(e) != 0;
+    }
+
     switch (tensor->op) {
         case GGML_OP_REDUCE:
             {
@@ -26937,7 +26947,7 @@ static int ggml_compute_forward(struct ggml_compute_params * params, struct ggml
         case GGML_OP_UNARY:
             {
                 const enum ggml_unary_op unary_op = ggml_get_unary_op(tensor);
-                if (fusion && unary_op == GGML_UNARY_OP_SIGMOID && i + 5 < cgraph->n_nodes &&
+                if (fusion && !ik_router_fusion_disabled && unary_op == GGML_UNARY_OP_SIGMOID && i + 5 < cgraph->n_nodes &&
                     cgraph->nodes[i+1]->op == GGML_OP_RESHAPE &&
                     cgraph->nodes[i+2]->op == GGML_OP_ADD &&
                     cgraph->nodes[i+3]->op == GGML_OP_ARGSORT &&
@@ -26946,7 +26956,7 @@ static int ggml_compute_forward(struct ggml_compute_params * params, struct ggml
                     iqk_glm45moe_experts(cgraph->nodes[i+5], cgraph->nodes[i+4], params->ith, params->nth);
                     i += 5;
                 }
-                else if (fusion && unary_op == GGML_UNARY_OP_SIGMOID && i + 4 < cgraph->n_nodes &&
+                else if (fusion && !ik_router_fusion_disabled && unary_op == GGML_UNARY_OP_SIGMOID && i + 4 < cgraph->n_nodes &&
                     cgraph->nodes[i+1]->op == GGML_OP_RESHAPE &&
                     cgraph->nodes[i+2]->op == GGML_OP_ADD &&
                     cgraph->nodes[i+3]->op == GGML_OP_GROUPED_TOPK &&
