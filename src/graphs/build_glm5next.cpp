@@ -545,6 +545,13 @@ ggml_cgraph * llm_build_context::build_glm5next() {
             // when the run straddles a pool boundary.
             const int64_t n_win = lctx.qsa_pooled_stale ? n_pool
                     : std::min<int64_t>(n_pool, (n_tokens + r - 1)/r + 1);
+            {
+                static const bool diag = getenv("IK_EXP_DIAG") != nullptr;
+                if (diag) {
+                    fprintf(stderr, "QSA_BUILD: n_tokens=%d n_pool=%lld n_win=%lld stale=%d\n",
+                            (int) n_tokens, (long long) n_pool, (long long) n_win, (int) lctx.qsa_pooled_stale);
+                }
+            }
             win_blocks = ggml_new_tensor_1d(ctx0, GGML_TYPE_I32, n_win);
             win_cells  = ggml_new_tensor_1d(ctx0, GGML_TYPE_I32, r * n_win);
             ggml_set_input(win_blocks);

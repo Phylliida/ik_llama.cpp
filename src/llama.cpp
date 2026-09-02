@@ -6927,6 +6927,21 @@ static int llama_expert_cache_dispatch_cb(ggml_tensor * t, bool ask, void * user
     return ok;
 }
 
+// exact-name match against the comma-separated IK_DUMP_TENSORS list
+static bool ik_dump_name_matches(const char * list, const char * name) {
+    const size_t nlen = strlen(name);
+    const char * b = list;
+    while (b && *b) {
+        const char * e = strchr(b, ',');
+        const size_t ilen = e ? (size_t)(e - b) : strlen(b);
+        if (ilen == nlen && strncmp(b, name, ilen) == 0) {
+            return true;
+        }
+        b = e ? e + 1 : nullptr;
+    }
+    return false;
+}
+
 // Mark the router output tensors as graph outputs so that the ggml allocator
 // keeps their data alive until the end of the graph compute (intermediate
 // tensors are otherwise freed/reused by later nodes before we can read them).
@@ -6965,6 +6980,18 @@ void llama_expert_trace_mark_outputs(ggml_cgraph * gf) {
             if (strncmp(name, prefix, strlen(prefix)) == 0) {
                 flag_chain(node);
                 break;
+            }
+        }
+    }
+
+    // IK_DUMP_TENSORS: keep named intermediates alive for end-of-graph dumps
+    // (comma-separated EXACT node names; see llama_dump_tensors_record)
+    static const char * dump_list = getenv("IK_DUMP_TENSORS");
+    if (dump_list && *dump_list) {
+        for (int i = 0; i < gf->n_nodes; i++) {
+            ggml_tensor * node = gf->nodes[i];
+            if (ik_dump_name_matches(dump_list, node->name)) {
+                flag_chain(node);
             }
         }
     }
@@ -7255,6 +7282,136 @@ static void llama_expert_trace_record(
         }
     }
     fflush(tracer->fp);
+}
+
+// IK_DUMP_TENSORS="name,..." + IK_DUMP_POS=P + IK_DUMP_FILE=path: when the ubatch's
+// position range covers P (±512 window, i.e. the neighboring ubatches too), append a
+// strided-safe contiguous dump of every exactly-named graph node to the file.
+// Used to localize the novlk cache-path divergence (2026-09-01).
+static void llama_dump_tensors_record(
+        llama_context & lctx,
+          ggml_cgraph * gf,
+     const llama_batch & ubatch) {
+    static const char * list = getenv("IK_DUMP_TENSORS");
+    if (!list || !*list) {
+        return;
+    }
+    static const int64_t target = atoll(getenv("IK_DUMP_POS") ? getenv("IK_DUMP_POS") : "-1");
+    if (target < 0 || !ubatch.pos || ubatch.n_tokens <= 0) {
+        return;
+    }
+    const int64_t pos0 = ubatch.pos[0];
+    if (llabs(pos0 - target) > 512) {
+        return;
+    }
+    static FILE * fp = nullptr;
+    if (!fp) {
+        const char * path = getenv("IK_DUMP_FILE");
+        fp = fopen(path && *path ? path : "ik_dump.bin", "wb");
+        if (!fp) {
+            return;
+        }
+    }
+    ggml_backend_sched_synchronize(lctx.sched);
+    int n_dumped = 0;
+    auto dump_one = [&](ggml_tensor * t) {
+        if (!ik_dump_name_matches(list, t->name)) {
+            return;
+        }
+        if (t->type != GGML_TYPE_F32 && t->type != GGML_TYPE_I32) {
+            fprintf(stderr, "IK_DUMP: skipping %s (type %d)\n", t->name, (int) t->type);
+            return;
+        }
+        const size_t esz = ggml_type_size(t->type);
+        const int64_t n0 = t->ne[0], n1 = t->ne[1], n2 = t->ne[2], n3 = t->ne[3];
+        std::vector<char> buf((size_t) n0*n1*n2*n3*esz);
+        for (int64_t i3 = 0; i3 < n3; i3++) {
+            for (int64_t i2 = 0; i2 < n2; i2++) {
+                for (int64_t i1 = 0; i1 < n1; i1++) {
+                    ggml_backend_tensor_get(t, buf.data() + (size_t) ((i3*n2 + i2)*n1 + i1)*n0*esz,
+                            (size_t) (i3*t->nb[3] + i2*t->nb[2] + i1*t->nb[1]), (size_t) n0*esz);
+                }
+            }
+        }
+        uint32_t nl = (uint32_t) strlen(t->name);
+        fwrite(&nl, 4, 1, fp);
+        fwrite(t->name, 1, nl, fp);
+        int32_t hdr[3] = { (int32_t) pos0, (int32_t) ubatch.n_tokens, (int32_t) t->type };
+        fwrite(hdr, 4, 3, fp);
+        int64_t dims[8] = { n0, n1, n2, n3, (int64_t) t->nb[1], (int64_t) t->nb[2], (int64_t) t->nb[3], (int64_t) buf.size() };
+        fwrite(dims, 8, 8, fp);
+        fwrite(buf.data(), 1, buf.size(), fp);
+        n_dumped++;
+    };
+    for (int i = 0; i < gf->n_nodes; i++) {
+        dump_one(gf->nodes[i]);
+    }
+    for (int i = 0; i < gf->n_leafs; i++) { // graph inputs (ffn_exp_cache_*-N etc.)
+        dump_one(gf->leafs[i]);
+    }
+    fflush(fp);
+    fprintf(stderr, "IK_DUMP: pos0=%lld dumped %d tensors\n", (long long) pos0, n_dumped);
+}
+
+// IK_SNAP_TENSORS="name,..." + IK_SNAP_POS_LO/HI + IK_SNAP_FILE: compute-time snapshots.
+// The sched eval callback fires right after the range containing a matching node was
+// computed and synchronized, so reads are fresh (clobber-immune — unlike end-of-graph
+// dumps, which proved unreliable for tensors whose buffers get reused late-graph).
+// Gate to ubatches whose first position is inside [POS_LO, POS_HI].
+// File-static state: debug tooling, single live context per process in practice.
+static struct {
+    FILE *  fp       = nullptr;
+    int64_t cur_pos0 = -1;
+    int64_t pos_lo   = -1;
+    int64_t pos_hi   = -1;
+} g_snap;
+
+static int llama_snap_cb(ggml_tensor * t, bool ask, void * user_data) {
+    (void) user_data;
+    static const char * list = getenv("IK_SNAP_TENSORS");
+    if (!list || !*list) {
+        return ask ? 0 : 1;
+    }
+    if (g_snap.cur_pos0 < g_snap.pos_lo || g_snap.cur_pos0 > g_snap.pos_hi) {
+        return ask ? 0 : 1;
+    }
+    if (!ik_dump_name_matches(list, t->name)) {
+        return ask ? 0 : 1;
+    }
+    if (ask) {
+        return 1; // cut the range here, sync, then we read on the non-ask call
+    }
+    if (!g_snap.fp) {
+        const char * path = getenv("IK_SNAP_FILE");
+        g_snap.fp = fopen(path && *path ? path : "ik_snap.bin", "wb");
+        if (!g_snap.fp) {
+            return 1;
+        }
+    }
+    if (t->type != GGML_TYPE_F32 && t->type != GGML_TYPE_I32) {
+        return 1;
+    }
+    const size_t esz = ggml_type_size(t->type);
+    const int64_t n0 = t->ne[0], n1 = t->ne[1], n2 = t->ne[2], n3 = t->ne[3];
+    std::vector<char> buf((size_t) n0*n1*n2*n3*esz);
+    for (int64_t i3 = 0; i3 < n3; i3++) {
+        for (int64_t i2 = 0; i2 < n2; i2++) {
+            for (int64_t i1 = 0; i1 < n1; i1++) {
+                ggml_backend_tensor_get(t, buf.data() + (size_t) ((i3*n2 + i2)*n1 + i1)*n0*esz,
+                        (size_t) (i3*t->nb[3] + i2*t->nb[2] + i1*t->nb[1]), (size_t) n0*esz);
+            }
+        }
+    }
+    uint32_t nl = (uint32_t) strlen(t->name);
+    fwrite(&nl, 4, 1, g_snap.fp);
+    fwrite(t->name, 1, nl, g_snap.fp);
+    int32_t hdr[3] = { (int32_t) g_snap.cur_pos0, 0, (int32_t) t->type };
+    fwrite(hdr, 4, 3, g_snap.fp);
+    int64_t dims[8] = { n0, n1, n2, n3, (int64_t) t->nb[1], (int64_t) t->nb[2], (int64_t) t->nb[3], (int64_t) buf.size() };
+    fwrite(dims, 8, 8, g_snap.fp);
+    fwrite(buf.data(), 1, buf.size(), g_snap.fp);
+    fflush(g_snap.fp);
+    return 1;
 }
 
 static void llama_graph_compute(
@@ -7771,11 +7928,13 @@ static int llama_decode_internal(
         tim1 = ggml_time_us();
 #endif
         //fprintf(stderr, "%s: invoking llama_graph_compute\n", __func__);
+        g_snap.cur_pos0 = u_batch.pos && u_batch.n_tokens > 0 ? (int64_t) u_batch.pos[0] : -1;
         llama_graph_compute(lctx, gf, n_threads);
 
         if (lctx.expert_tracer) {
             llama_expert_trace_record(lctx, gf, u_batch);
         }
+        llama_dump_tensors_record(lctx, gf, u_batch); // no-op unless IK_DUMP_TENSORS set
 
         if (lctx.model.arch == LLM_ARCH_DEEPSEEK4 &&
             lctx.cparams.mtp_op_type == MTP_OP_NONE &&
@@ -13091,6 +13250,19 @@ bool llama_expert_trace_start(struct llama_context * ctx, const char * path) {
             ctx->cparams.cb_eval           = llama_expert_trace_snap_cb;
             ctx->cparams.cb_eval_user_data = &tracer->snap;
         }
+    }
+    if (getenv("IK_SNAP_TENSORS") != nullptr) {
+        // compute-time tensor snapshots (M1 divergence forensics, 2026-09-01)
+        g_snap.pos_lo = atoll(getenv("IK_SNAP_POS_LO") ? getenv("IK_SNAP_POS_LO") : "0");
+        g_snap.pos_hi = atoll(getenv("IK_SNAP_POS_HI") ? getenv("IK_SNAP_POS_HI") : "0");
+        if (ctx->expert_cache) {
+            ctx->chained_eval_cb = llama_snap_cb;   // NOTE: overrides IK_EXPVERIFY chaining; don't combine
+            ctx->chained_eval_ud = nullptr;
+        } else {
+            ctx->cparams.cb_eval           = llama_snap_cb;
+            ctx->cparams.cb_eval_user_data = nullptr;
+        }
+        fprintf(stderr, "IK_SNAP: active, window [%lld, %lld]\n", (long long) g_snap.pos_lo, (long long) g_snap.pos_hi);
     }
     ctx->expert_tracer = std::move(tracer);
 
