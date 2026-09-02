@@ -10155,6 +10155,13 @@ struct llama_context * llama_init_from_model(
 #endif
             ctx->sched = ggml_backend_sched_new(ctx->backends.data(), backend_buft.data(), ctx->backends.size(), max_nodes, pipeline_parallel);
 
+            if (ctx->expert_cache && ctx->expert_cache->slots_on_cuda) {
+                // M2: hot ids/mask inputs must live on the CUDA backend (their consumers
+                // do); the default input->CPU placement + split-start copies cannot be
+                // refreshed by the mid-graph classify callback (illegal access otherwise)
+                ggml_backend_sched_set_expert_cache_cuda_inputs(ctx->sched, true);
+            }
+
             if (pipeline_parallel) {
                 LLAMA_LOG_INFO("%s: pipeline parallelism enabled (n_copies=%d)\n", __func__, ggml_backend_sched_get_n_copies(ctx->sched));
             }
@@ -10178,6 +10185,9 @@ struct llama_context * llama_init_from_model(
                 if (pipeline_parallel) {
                     LLAMA_LOG_WARN("%s: compute buffer allocation failed, retrying without pipeline parallelism\n", __func__);
                     ctx->sched = ggml_backend_sched_new(ctx->backends.data(), backend_buft.data(), ctx->backends.size(), max_nodes, false);
+                    if (ctx->expert_cache && ctx->expert_cache->slots_on_cuda) {
+                        ggml_backend_sched_set_expert_cache_cuda_inputs(ctx->sched, true);
+                    }
                     gf_success = ggml_backend_sched_reserve(ctx->sched, gf);
                 }
                 if (!gf_success) {

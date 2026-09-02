@@ -1199,6 +1199,7 @@ struct ggml_backend_sched {
     std::array<bool, GGML_SCHED_MAX_BACKENDS> own_cpy;
 
     bool only_active_experts;
+    bool expert_cache_cuda_inputs = false; // place ffn_exp_cache_hot_* inputs on backend 0
     bool split_mode_graph;
     bool is_async = false;
     bool debug;
@@ -1225,6 +1226,16 @@ void ggml_backend_sched_set_op_offload(ggml_backend_sched_t sched, enum ggml_op 
 void ggml_backend_sched_set_only_active_experts(ggml_backend_sched_t sched, bool on_or_off) {
     if (!sched) return;
     sched->only_active_experts = on_or_off;
+}
+
+// Phase 4: when expert-cache hot slots are device-resident, the hot ids/mask graph
+// inputs must live on the same (first/CUDA) backend: the default input->last-backend
+// rule would otherwise leave them host-resident while the hot MoE ops run on CUDA,
+// and the split-start input copies cannot be refreshed by the mid-graph classify
+// callback (stale/garbage ids -> OOB gathers -> illegal access).
+void ggml_backend_sched_set_expert_cache_cuda_inputs(ggml_backend_sched_t sched, bool on_or_off) {
+    if (!sched) return;
+    sched->expert_cache_cuda_inputs = on_or_off;
 }
 
 void ggml_backend_sched_set_split_mode_graph(ggml_backend_sched_t sched, bool on_or_off, bool async) {
@@ -1332,6 +1343,13 @@ static int ggml_backend_sched_backend_id_from_cur(ggml_backend_sched_t sched, st
 
     // graph input
     if (tensor->flags & GGML_TENSOR_FLAG_INPUT) {
+        if (sched->expert_cache_cuda_inputs && tensor->name &&
+            (strncmp(tensor->name, "ffn_exp_cache_hot_ids-",  22) == 0 ||
+             strncmp(tensor->name, "ffn_exp_cache_hot_mask-", 23) == 0)) {
+            cur_backend_id = 0; // hot consumers run on the first (CUDA) backend
+            SET_CAUSE(tensor, "1.inp_ec");
+            return cur_backend_id;
+        }
         cur_backend_id = sched->n_backends - 1; // last backend (assumed CPU)
         SET_CAUSE(tensor, "1.inp");
         return cur_backend_id;
