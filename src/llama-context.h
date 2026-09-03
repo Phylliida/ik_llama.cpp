@@ -11,6 +11,7 @@ struct llama_model;
 #include <vector>
 #include <map>
 #include <set>
+#include <deque>
 #include <memory>
 
 struct llama_swa_window_view {
@@ -407,11 +408,30 @@ struct llama_context {
         ggml_tensor * hot_ids  = nullptr; // I32 [n_expert_used, n_tokens] slot | -1 (CPU) / H-trash (CUDA)
         ggml_tensor * hot_mask = nullptr; // F32 [n_expert_used, n_tokens] 1.0 hit / 0.0 miss
         ggml_tensor * cold_ids = nullptr; // I32 [n_expert_used, n_tokens] expert id | -1 (hit)
+
+        // M3a shadow simulation of the dynamic LRU policy (see
+        // llama_expert_cache_step_boundary in llama.cpp). Updated only at TG
+        // step boundaries from classify-staged routing observations; never read
+        // by graph construction or the classify mask writes, so it has zero
+        // influence on compute. Promotion goes live in M3b/c.
+        std::vector<int32_t> sim_remap;        // [n_expert] sim: expert id -> slot | -1
+        std::vector<int32_t> sim_slot_expert;  // [H] sim: slot -> expert id
+        std::vector<int32_t> sim_lru;          // slots by recency, back = most recently used
+        std::vector<uint16_t> sim_miss_count;  // [n_expert] sim misses within the rolling window
+        std::deque<std::vector<int32_t>> sim_miss_log; // per-step sim-missed ids, windowed
+        // classify-staged routing of the current TG compute:
+        std::vector<int32_t> sim_staged_ids;   // [k*ntok] routed ids
+        int64_t  sim_staged_k    = 0;
+        int64_t  sim_staged_ntok = 0;
+        uint64_t sim_staged_step = UINT64_MAX; // cache->step tag, guards double-staging
+        uint64_t sim_hits = 0, sim_miss = 0, sim_promotions = 0, sim_admissions = 0;
     };
     struct expert_cache_state {
         int32_t h = 0;                    // resident slots per layer
         bool    slots_on_cuda = false;    // hot slot tensors live on a GPU backend (M2+)
         std::map<int32_t, expert_cache_layer_state> layers; // keyed by layer index
+        uint64_t step = 0;                     // TG steps processed by the boundary hook (M3a)
+        std::vector<int32_t> staged_layers;    // layers with staged ids for the current step
     };
     std::unique_ptr<expert_cache_state> expert_cache;
     bool expert_cache_pending = false; // install dispatcher once params.cb_eval has been copied

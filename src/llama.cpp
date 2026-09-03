@@ -6787,7 +6787,7 @@ static int llama_expert_trace_snap_cb(ggml_tensor * t, bool ask, void * user_dat
 // get_rows execute, so reading the ids at the get_rows trigger is always fresh.
 static int llama_expert_cache_eval_cb(ggml_tensor * t, bool ask, void * user_data) {
     llama_context * lctx = (llama_context *) user_data;
-    const auto & cache = lctx->expert_cache;
+    const auto & cache = lctx->expert_cache; // non-const layers are reached via it->second below
     if (!cache) {
         return ask ? 0 : 1;
     }
@@ -6922,6 +6922,19 @@ static int llama_expert_cache_eval_cb(ggml_tensor * t, bool ask, void * user_dat
     write_cols(cold_ids, cold_all.data(), sizeof(int32_t), host_cold);
     write_cols(hot_mask, mask_all.data(), sizeof(float),   host_mask);
 
+    // M3a: stage this step's routed ids for the shadow LRU simulation, applied
+    // by llama_expert_cache_step_boundary after the step's compute. TG-shaped
+    // computes only (k, ntok <= 8): PP batches and the warmup graph (k ==
+    // n_expert) stay fully read-only. Mutation of sim state happens only at
+    // the boundary; the live remap/slots stay the static dummy until M3b/c.
+    if (k <= 8 && ntok <= 8 && cl.sim_staged_step != cache->step) {
+        cl.sim_staged_ids  = ids;
+        cl.sim_staged_k    = k;
+        cl.sim_staged_ntok = ntok;
+        cl.sim_staged_step = cache->step;
+        cache->staged_layers.push_back(il);
+    }
+
     static int dbg = -1;
     if (dbg < 0) {
         dbg = getenv("IK_EXP_CACHE_DEBUG") ? 1 : 0;
@@ -6963,6 +6976,116 @@ static int llama_expert_cache_dispatch_cb(ggml_tensor * t, bool ask, void * user
         ok = lctx->chained_eval_cb(t, false, lctx->chained_eval_ud) && ok;
     }
     return ok;
+}
+
+// -------------------------------------------------------------------------
+// M3a: TG step boundary. Applies the classify-staged routing observations of
+// the just-computed step to the per-layer shadow LRU simulation: hit touches,
+// classic-LRU promotion/eviction, and the rolling miss-count window that the
+// M3c admission filter (promote on 2nd miss within N steps) will consult.
+// Mutates ONLY sim_* fields — the live remap and slot contents stay the
+// static dummy, so this changes no compute behavior. PP is never staged, so
+// PP steps are full no-ops here.
+static void llama_expert_cache_step_boundary(llama_context & lctx) {
+    auto & cache = lctx.expert_cache;
+    if (!cache || cache->staged_layers.empty()) {
+        return;
+    }
+    static const int32_t window = [] {
+        const char * e = getenv("IK_EXP_CACHE_WINDOW");
+        return e ? atoi(e) : 64;
+    }();
+    for (int32_t il : cache->staged_layers) {
+        auto & cl = cache->layers[il];
+        const int64_t k    = cl.sim_staged_k;
+        const int64_t ntok = cl.sim_staged_ntok;
+        const int32_t n_expert = (int32_t) cl.sim_remap.size();
+        std::vector<int32_t> missed; // distinct ids promoted this step, in order
+        missed.reserve((size_t) k * ntok);
+        for (int64_t c = 0; c < ntok; c++) {
+            for (int64_t j = 0; j < k; j++) {
+                const int32_t id = cl.sim_staged_ids[(size_t) c * k + j];
+                if (id < 0 || id >= n_expert) {
+                    continue;
+                }
+                const int32_t slot = cl.sim_remap[id];
+                if (slot >= 0) {
+                    cl.sim_hits++;
+                    // touch: move the slot to MRU (back)
+                    auto & lru = cl.sim_lru;
+                    for (size_t p = 0; p < lru.size(); p++) {
+                        if (lru[p] == slot) {
+                            lru.erase(lru.begin() + p);
+                            break;
+                        }
+                    }
+                    lru.push_back(slot);
+                } else {
+                    cl.sim_miss++;
+                    // classic LRU: promote immediately into the LRU slot
+                    const int32_t victim = cl.sim_lru.front();
+                    cl.sim_lru.erase(cl.sim_lru.begin());
+                    cl.sim_lru.push_back(victim);
+                    const int32_t old = cl.sim_slot_expert[victim];
+                    if (old >= 0) {
+                        cl.sim_remap[old] = -1;
+                    }
+                    cl.sim_slot_expert[victim] = id;
+                    cl.sim_remap[id]           = victim;
+                    cl.sim_promotions++;
+                    // rolling-window miss bookkeeping: >=2 windowed misses is a
+                    // would-be admission under the M3c 2nd-miss filter
+                    if (++cl.sim_miss_count[id] >= 2) {
+                        cl.sim_admissions++;
+                    }
+                    missed.push_back(id);
+                }
+            }
+        }
+        cl.sim_miss_log.push_back(std::move(missed));
+        while ((int32_t) cl.sim_miss_log.size() > window) {
+            for (int32_t id : cl.sim_miss_log.front()) {
+                if (cl.sim_miss_count[id] > 0) {
+                    cl.sim_miss_count[id]--;
+                }
+            }
+            cl.sim_miss_log.pop_front();
+        }
+    }
+    cache->staged_layers.clear();
+    cache->step++;
+
+    static int dbg = -1;
+    if (dbg < 0) {
+        dbg = getenv("IK_EXP_CACHE_DEBUG") ? 1 : 0;
+    }
+    static const uint64_t print_every = [] {
+        const char * e = getenv("IK_EXP_CACHE_SIM_EVERY");
+        return e ? (uint64_t) atol(e) : 100;
+    }();
+    if (dbg && print_every > 0 && cache->step % print_every == 0) {
+        uint64_t h = 0, m = 0, promo = 0, adm = 0;
+        std::string per_layer;
+        per_layer.reserve(cache->layers.size() * 12);
+        for (auto & kv : cache->layers) {
+            const auto & cl = kv.second;
+            h += cl.sim_hits; m += cl.sim_miss;
+            promo += cl.sim_promotions; adm += cl.sim_admissions;
+            const uint64_t lt = cl.sim_hits + cl.sim_miss;
+            char buf[32];
+            snprintf(buf, sizeof(buf), " L%d=%.3f", kv.first, lt ? (double) cl.sim_hits / lt : 0.0);
+            per_layer += buf;
+        }
+        static uint64_t last_promo = 0;
+        fprintf(stderr, "EXP_CACHE_SIM step=%llu hit=%.4f promo=%llu (+%llu/last-%llu-steps, %.2f/step) adm2=%llu\n",
+                (unsigned long long) cache->step,
+                h + m ? (double) h / (h + m) : 0.0,
+                (unsigned long long) promo, (unsigned long long) (promo - last_promo),
+                (unsigned long long) print_every, (double) (promo - last_promo) / print_every,
+                (unsigned long long) adm);
+        fprintf(stderr, "EXP_CACHE_SIM_LAYERS step=%llu%s\n", (unsigned long long) cache->step, per_layer.c_str());
+        last_promo = promo;
+    }
 }
 
 // exact-name match against the comma-separated IK_DUMP_TENSORS list
@@ -7968,6 +8091,12 @@ static int llama_decode_internal(
         //fprintf(stderr, "%s: invoking llama_graph_compute\n", __func__);
         g_snap.cur_pos0 = u_batch.pos && u_batch.n_tokens > 0 ? (int64_t) u_batch.pos[0] : -1;
         llama_graph_compute(lctx, gf, n_threads);
+
+        // M3a: TG step boundary — apply classify-staged routing to the shadow
+        // LRU sim. PP ubatches (n_tokens > 8) are read-only by design.
+        if (lctx.expert_cache && n_tokens <= 8) {
+            llama_expert_cache_step_boundary(lctx);
+        }
 
         if (lctx.expert_tracer) {
             llama_expert_trace_record(lctx, gf, u_batch);
@@ -9649,6 +9778,15 @@ struct llama_context * llama_init_from_model(
                 cl.remap[s] = s;
                 cl.slot_expert[s] = s;
             }
+            // M3a shadow sim: starts from the same static assignment as the
+            // live remap (slots 0..H-1 = experts 0..H-1, LRU order cold).
+            cl.sim_remap       = cl.remap;
+            cl.sim_slot_expert.assign(cl.slot_expert.begin(), cl.slot_expert.begin() + H);
+            cl.sim_lru.resize(H);
+            for (int32_t s = 0; s < H; s++) {
+                cl.sim_lru[s] = s; // back (s = H-1) = most recently used
+            }
+            cl.sim_miss_count.assign(n_expert, 0);
         }
         ctx->expert_cache_pending = true; // callback installed after params.cb_eval is copied below
         LLAMA_LOG_INFO("%s: expert cache active: H=%d, %zu layers (static dummy assignment, slots on %s)\n", __func__,
