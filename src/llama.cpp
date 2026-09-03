@@ -6875,11 +6875,34 @@ static int llama_expert_cache_eval_cb(ggml_tensor * t, bool ask, void * user_dat
     std::vector<int32_t> hot_all((size_t) k * ntok), cold_all((size_t) k * ntok);
     std::vector<float>   mask_all((size_t) k * ntok);
     for (int64_t c = 0; c < ntok; c++) {
+        // The CUDA mmq_id path (launch_mmq_ids_helper) sizes its shared-memory store by
+        // n_tokens, which assumes at most one (slot, token) pair per slot -- true for
+        // distinct expert ids, broken if every miss maps to one trash slot (up to k*ntok
+        // pairs in one slot -> shared overflow -> garbage gather -> illegal access).
+        // So on CUDA, misses are assigned DISTINCT free slots per token (any resident
+        // slot's output is finite and masked to zero afterwards, so semantics unchanged).
+        uint32_t used = 0; // slot bitmask (H+1 <= 32 slots)
+        for (int64_t j = 0; j < k; j++) {
+            const int32_t id   = ids[(size_t) c * k + j];
+            const int32_t slot = (id >= 0 && id < n_expert) ? cl.remap[id] : -1;
+            if (slot >= 0 && slot < 32) {
+                used |= (1u << slot);
+            }
+        }
         for (int64_t j = 0; j < k; j++) {
             const int32_t id   = ids[(size_t) c * k + j];
             const int32_t slot = (id >= 0 && id < n_expert) ? cl.remap[id] : -1;
             const bool    hit  = slot >= 0;
-            hot_all [(size_t) c * k + j] = hit ? slot : (cuda_slots ? trash_slot : -1);
+            int32_t       h    = hit ? slot : -1;
+            if (!hit && cuda_slots) {
+                int32_t free_slot = trash_slot;
+                for (int32_t s = 0; s <= trash_slot && s < 32; s++) {
+                    if (!(used & (1u << s))) { free_slot = s; break; }
+                }
+                used |= (1u << free_slot);
+                h = free_slot;
+            }
+            hot_all [(size_t) c * k + j] = h;
             cold_all[(size_t) c * k + j] = hit ? -1   : id;
             mask_all[(size_t) c * k + j] = hit ? 1.0f : 0.0f;
         }
