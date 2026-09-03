@@ -44,6 +44,27 @@ GGML_API GGML_CALL void ggml_backend_cuda_unregister_host_buffer(void * buffer);
 GGML_API GGML_CALL void ggml_backend_cuda_log_set_callback(ggml_log_callback log_callback, void * user_data);
 
 GGML_API GGML_CALL void ggml_backend_cuda_invalidate_graphs(const void * model);
+
+// Phase 4 expert cache promotion (M3b): a dedicated-copy-stream async HtoD
+// engine bound to one CUDA backend/device. Copies are ordered after the
+// compute-stream point captured by sync_compute() at queue time, so a slot can
+// be overwritten while later compute is already in flight (the slot must be
+// excluded from reads until the copy fence completes — enforced by the
+// caller). Fence ids are monotonically increasing; polling a completed fence
+// retires it and all earlier fences (one copy stream => in-order completion).
+typedef struct ggml_cuda_copy_engine * ggml_cuda_copy_engine_t;
+
+GGML_API GGML_CALL ggml_cuda_copy_engine_t ggml_backend_cuda_copy_engine_new(ggml_backend_t backend);
+GGML_API GGML_CALL void                      ggml_backend_cuda_copy_engine_free(ggml_cuda_copy_engine_t engine);
+// order subsequently enqueued copies after all work submitted so far on the
+// backend's compute stream; call at queue time, before the job's h2d calls
+GGML_API GGML_CALL void                      ggml_backend_cuda_copy_engine_sync_compute(ggml_cuda_copy_engine_t engine);
+// enqueue one HtoD copy on the copy stream; dst = device pointer on the engine's device
+GGML_API GGML_CALL void                      ggml_backend_cuda_copy_engine_h2d(ggml_cuda_copy_engine_t engine, void * dst, const void * src, size_t size);
+// record a fence after all copies enqueued so far on the copy stream
+GGML_API GGML_CALL uint64_t                  ggml_backend_cuda_copy_engine_fence_copy(ggml_cuda_copy_engine_t engine);
+// true when the fence's work has completed (an already-retired id counts as complete)
+GGML_API GGML_CALL bool                      ggml_backend_cuda_copy_engine_poll(ggml_cuda_copy_engine_t engine, uint64_t fence);
 #ifdef  __cplusplus
 }
 #endif

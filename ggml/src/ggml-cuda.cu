@@ -5299,6 +5299,100 @@ static void ggml_backend_cuda_event_synchronize(ggml_backend_event_t event) {
     CUDA_CHECK(cudaEventSynchronize((cudaEvent_t)event->context));
 }
 
+// -------------------------------------------------------------------------
+// Phase 4 expert cache promotion (M3b): dedicated-copy-stream async HtoD
+// engine. See ggml-cuda.h for the API contract. The engine owns its stream
+// and events, so freeing it after the backend is safe (it only keeps the
+// device index, never the backend context).
+
+struct ggml_cuda_copy_engine {
+    int          device      = -1;
+    cudaStream_t copy_stream = nullptr;
+    cudaStream_t compute_stream = nullptr; // borrowed from the backend context
+    uint64_t     next_fence  = 1;
+    std::mutex   mtx;                      // guards events + next_fence
+    std::map<uint64_t, cudaEvent_t> events;
+};
+
+GGML_CALL ggml_cuda_copy_engine_t ggml_backend_cuda_copy_engine_new(ggml_backend_t backend) {
+    if (!backend || !ggml_backend_is_cuda(backend)) {
+        return nullptr;
+    }
+    ggml_backend_cuda_context * cuda_ctx = (ggml_backend_cuda_context *) backend->context;
+    ggml_cuda_set_device(cuda_ctx->device);
+    ggml_cuda_copy_engine_t engine = new ggml_cuda_copy_engine;
+    engine->device         = cuda_ctx->device;
+    engine->compute_stream = cuda_ctx->stream();
+    CUDA_CHECK(cudaStreamCreateWithFlags(&engine->copy_stream, cudaStreamNonBlocking));
+    return engine;
+}
+
+GGML_CALL void ggml_backend_cuda_copy_engine_free(ggml_cuda_copy_engine_t engine) {
+    if (!engine) {
+        return;
+    }
+    ggml_cuda_set_device(engine->device);
+    if (engine->copy_stream) {
+        CUDA_CHECK(cudaStreamSynchronize(engine->copy_stream)); // drain in-flight copies
+        CUDA_CHECK(cudaStreamDestroy(engine->copy_stream));
+        engine->copy_stream = nullptr;
+    }
+    for (auto & kv : engine->events) {
+        CUDA_CHECK(cudaEventDestroy(kv.second));
+    }
+    engine->events.clear();
+    delete engine;
+}
+
+GGML_CALL void ggml_backend_cuda_copy_engine_sync_compute(ggml_cuda_copy_engine_t engine) {
+    std::lock_guard<std::mutex> lock(engine->mtx); // serializes with the worker's enqueues
+    ggml_cuda_set_device(engine->device);
+    // record on the compute stream, wait on the copy stream, destroy right
+    // away: cudaStreamWaitEvent snapshots the captured work at call time, so
+    // the event has no lifetime ties after this call
+    cudaEvent_t ev;
+    CUDA_CHECK(cudaEventCreateWithFlags(&ev, cudaEventDisableTiming));
+    CUDA_CHECK(cudaEventRecord(ev, engine->compute_stream));
+    CUDA_CHECK(cudaStreamWaitEvent(engine->copy_stream, ev, 0));
+    CUDA_CHECK(cudaEventDestroy(ev));
+}
+
+GGML_CALL void ggml_backend_cuda_copy_engine_h2d(ggml_cuda_copy_engine_t engine, void * dst, const void * src, size_t size) {
+    ggml_cuda_set_device(engine->device);
+    CUDA_CHECK(cudaMemcpyAsync(dst, src, size, cudaMemcpyHostToDevice, engine->copy_stream));
+}
+
+GGML_CALL uint64_t ggml_backend_cuda_copy_engine_fence_copy(ggml_cuda_copy_engine_t engine) {
+    std::lock_guard<std::mutex> lock(engine->mtx);
+    ggml_cuda_set_device(engine->device);
+    cudaEvent_t ev;
+    CUDA_CHECK(cudaEventCreateWithFlags(&ev, cudaEventDisableTiming));
+    CUDA_CHECK(cudaEventRecord(ev, engine->copy_stream));
+    const uint64_t id = engine->next_fence++;
+    engine->events[id] = ev;
+    return id;
+}
+
+GGML_CALL bool ggml_backend_cuda_copy_engine_poll(ggml_cuda_copy_engine_t engine, uint64_t fence) {
+    std::lock_guard<std::mutex> lock(engine->mtx);
+    auto it = engine->events.find(fence);
+    if (it == engine->events.end()) {
+        return true; // retired == completed
+    }
+    const cudaError_t st = cudaEventQuery(it->second);
+    if (st == cudaErrorNotReady) {
+        return false;
+    }
+    CUDA_CHECK(st);
+    // retire this fence and all earlier ones (one copy stream => fences
+    // complete in id order; only copy fences are ever stored)
+    while (!engine->events.empty() && engine->events.begin()->first <= fence) {
+        CUDA_CHECK(cudaEventDestroy(engine->events.begin()->second));
+        engine->events.erase(engine->events.begin());
+    }
+    return true;
+}
+
 static ggml_backend_i ggml_backend_cuda_interface = {
     /* .get_name                = */ ggml_backend_cuda_name,
     /* .free                    = */ ggml_backend_cuda_free,

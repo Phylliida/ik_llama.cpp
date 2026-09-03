@@ -409,6 +409,16 @@ struct llama_context {
         ggml_tensor * hot_mask = nullptr; // F32 [n_expert_used, n_tokens] 1.0 hit / 0.0 miss
         ggml_tensor * cold_ids = nullptr; // I32 [n_expert_used, n_tokens] expert id | -1 (hit)
 
+        // M3b live promotion state (see llama_expert_cache_step_boundary and
+        // expert_cache_state::expert_cache_promoter in llama.cpp): a slot
+        // being overwritten is PENDING — remap[old] = -1 from queue time, the
+        // classify free-slot scan skips pending slots (a compute reading a
+        // mid-overwrite slot can yield NaN/Inf and 0*NaN = NaN poisons the MoE
+        // sum), and remap[new] is published only after the copy completes.
+        // Max 1 pending slot per layer (the scan needs k <= 8 distinct free
+        // slots out of H+1).
+        uint64_t pending_mask = 0; // bit s set: slot s mid-overwrite, unreadable
+
         // M3a shadow simulation of the dynamic LRU policy (see
         // llama_expert_cache_step_boundary in llama.cpp). Updated only at TG
         // step boundaries from classify-staged routing observations; never read
@@ -432,6 +442,10 @@ struct llama_context {
         std::map<int32_t, expert_cache_layer_state> layers; // keyed by layer index
         uint64_t step = 0;                     // TG steps processed by the boundary hook (M3a)
         std::vector<int32_t> staged_layers;    // layers with staged ids for the current step
+        // M3b: promotion worker (thread + dedicated CUDA copy stream); defined
+        // in llama.cpp, created lazily on the first queued promotion
+        struct expert_cache_promoter;
+        std::unique_ptr<expert_cache_promoter> promoter;
     };
     std::unique_ptr<expert_cache_state> expert_cache;
     bool expert_cache_pending = false; // install dispatcher once params.cb_eval has been copied

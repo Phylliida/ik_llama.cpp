@@ -103,6 +103,7 @@ void llama_set_mtp_n_heads(struct llama_context * ctx, int32_t mtp_n_heads);
 #include <cstdlib>
 #include <cstring>
 #include <ctime>
+#include <condition_variable>
 #include <fstream>
 #include <functional>
 #include <future>
@@ -6895,9 +6896,23 @@ static int llama_expert_cache_eval_cb(ggml_tensor * t, bool ask, void * user_dat
             const bool    hit  = slot >= 0;
             int32_t       h    = hit ? slot : -1;
             if (!hit && cuda_slots) {
+                // M3b: pending slots (mid-overwrite by a promotion copy) are
+                // excluded — compute must never read them (0*NaN = NaN poison)
                 int32_t free_slot = trash_slot;
+                bool    found = false;
                 for (int32_t s = 0; s <= trash_slot && s < 32; s++) {
-                    if (!(used & (1u << s))) { free_slot = s; break; }
+                    if (!(used & (1u << s)) && !(cl.pending_mask & (1ull << s))) { free_slot = s; found = true; break; }
+                }
+                if (!found && k <= 8) {
+                    // reachable only if pending slots starve the scan (k=8 misses
+                    // need <= 8 distinct free of H+1 slots => max 1 pending/layer);
+                    // k > 8 (warmup graph: k == n_expert) always exhausts slots —
+                    // pre-existing benign duplicate-slot behavior, don't warn
+                    static bool warned_no_free = false;
+                    if (!warned_no_free) {
+                        warned_no_free = true;
+                        LLAMA_LOG_WARN("expert cache: no free slot for a miss on layer %d; duplicate slot assignment\n", il);
+                    }
                 }
                 used |= (1u << free_slot);
                 h = free_slot;
@@ -6979,16 +6994,267 @@ static int llama_expert_cache_dispatch_cb(ggml_tensor * t, bool ask, void * user
 }
 
 // -------------------------------------------------------------------------
+// M3b: promotion worker. One thread drains a queue of (layer, slot, expert)
+// promotions; per job it copies the expert's 3 slices (up/gate/down, 8.56 MB
+// total for GLM-5.3) from the host-resident full expert tensors into the slot:
+// HtoD on a dedicated CUDA copy stream (slots_on_cuda; event-ordered after the
+// boundary's compute-stream point) or plain memcpy (host slots, M1 configs).
+// Completion is polled at the next TG step boundary, which then publishes
+// remap[expert] = slot. Pool shape cribbed from ggml-moe-prefetch.cpp's
+// prefetch_pool. All policy state (remap/pending_mask) is touched by the
+// decode thread only; the worker touches just the queue/pending FIFOs.
+struct llama_context::expert_cache_state::expert_cache_promoter {
+    struct job {
+        int32_t     il = -1, slot = -1, expert = -1;
+        const void * src[3] = {}; // up/gate/down expert slices (host)
+        void *       dst[3] = {}; // up/gate/down slot slices (device or host)
+        size_t       size[3] = {};
+    };
+
+    std::mutex              mtx;
+    std::condition_variable cv;
+    std::deque<job>         queue;
+    std::thread             worker;
+    bool                    shutdown = false;
+
+    // jobs whose copies were issued, in issue order (FIFO completion)
+    struct inflight { int32_t il, slot, expert; uint64_t copy_fence; };
+    std::deque<inflight>    pending;
+
+#ifdef GGML_USE_CUDA
+    ggml_cuda_copy_engine_t engine = nullptr; // slots_on_cuda only
+#endif
+
+    ~expert_cache_promoter() {
+        {
+            std::lock_guard<std::mutex> lock(mtx);
+            shutdown = true;
+        }
+        cv.notify_all();
+        if (worker.joinable()) {
+            worker.join();
+        }
+#ifdef GGML_USE_CUDA
+        if (engine) {
+            ggml_backend_cuda_copy_engine_free(engine); // drains the copy stream first
+        }
+#endif
+    }
+
+    void run() {
+        for (;;) {
+            job j;
+            {
+                std::unique_lock<std::mutex> lock(mtx);
+                cv.wait(lock, [this] { return shutdown || !queue.empty(); });
+                if (shutdown) {
+                    return; // drop queued jobs; the context is going away
+                }
+                j = std::move(queue.front());
+                queue.pop_front();
+            }
+#ifdef GGML_USE_CUDA
+            if (engine) {
+                // ordering vs the compute stream was already enqueued at queue
+                // time (sync_compute); the copy stream is FIFO
+                for (int i = 0; i < 3; i++) {
+                    ggml_backend_cuda_copy_engine_h2d(engine, j.dst[i], j.src[i], j.size[i]);
+                }
+                const uint64_t f = ggml_backend_cuda_copy_engine_fence_copy(engine);
+                std::lock_guard<std::mutex> lock(mtx);
+                pending.push_back({ j.il, j.slot, j.expert, f });
+                continue;
+            }
+#endif
+            for (int i = 0; i < 3; i++) {
+                memcpy(j.dst[i], j.src[i], j.size[i]); // host slots: complete at issue
+            }
+            {
+                std::lock_guard<std::mutex> lock(mtx);
+                pending.push_back({ j.il, j.slot, j.expert, 0 });
+            }
+        }
+    }
+
+    void submit(job j) {
+        {
+            std::lock_guard<std::mutex> lock(mtx);
+            if (!worker.joinable()) {
+                worker = std::thread([this] { run(); });
+            }
+            queue.push_back(std::move(j));
+        }
+        cv.notify_one();
+    }
+};
+
+// Tearing-safe eviction + promotion queueing (design point 2 in
+// PHASE4-M3-PLAN.md): remap[old] = -1 and the slot goes PENDING at queue time
+// (the old expert immediately falls back to the cold path — placement changes
+// never change the math domain); the copy is ordered after the just-submitted
+// step's compute; remap[new] = slot is published only after the copy fence
+// completes. On any setup failure the state is left untouched (the expert
+// simply stays cold).
+static void llama_expert_cache_queue_promotion(llama_context & lctx, int32_t il, int32_t slot, int32_t expert) {
+    auto & cache = lctx.expert_cache;
+    auto & cl    = cache->layers[il];
+    const auto & layer = lctx.model.layers[il];
+
+    // hard invariant: max 1 pending slot per layer — the classify free-slot
+    // scan needs k <= 8 distinct free slots out of H+1, which 2 pending slots
+    // at H=8 would break (duplicate assignment => 0*NaN poison)
+    if (cl.pending_mask != 0) {
+        LLAMA_LOG_WARN("expert cache: promotion L%d expert %d skipped — a slot is already pending\n", il, expert);
+        return;
+    }
+    if (slot < 0 || slot > cache->h || slot >= 64 || expert < 0 || expert >= (int32_t) cl.remap.size() || cl.remap[expert] >= 0) {
+        LLAMA_LOG_WARN("expert cache: promotion L%d slot %d expert %d skipped — out of range or already resident\n", il, slot, expert);
+        return;
+    }
+
+    const ggml_tensor * srcs[3] = { layer.ffn_up_exps,     layer.ffn_gate_exps,     layer.ffn_down_exps     };
+    const ggml_tensor * dsts[3] = { layer.ffn_up_exps_hot, layer.ffn_gate_exps_hot, layer.ffn_down_exps_hot };
+
+    llama_context::expert_cache_state::expert_cache_promoter::job j;
+    j.il = il; j.slot = slot; j.expert = expert;
+    for (int i = 0; i < 3; i++) {
+        if (!srcs[i] || !dsts[i] || !ggml_backend_buffer_is_host(srcs[i]->buffer)) {
+            LLAMA_LOG_WARN("expert cache: promotion L%d expert %d skipped — cold expert tensor %d not host-resident\n", il, expert, i);
+            return;
+        }
+        const size_t esize = srcs[i]->nb[2];
+        GGML_ASSERT(dsts[i]->nb[2] == esize); // same type/shape as the fill code assumes
+        j.src[i]  = (const char *) srcs[i]->data + (size_t) expert * esize;
+        j.dst[i]  = (char *)       dsts[i]->data + (size_t) slot   * esize;
+        j.size[i] = esize;
+    }
+
+    if (!cache->promoter) {
+        cache->promoter = std::make_unique<llama_context::expert_cache_state::expert_cache_promoter>();
+    }
+#ifdef GGML_USE_CUDA
+    if (cache->slots_on_cuda && !cache->promoter->engine) {
+        const int bi = ggml_backend_sched_get_backend_idx(lctx.sched, dsts[0]->buffer);
+        ggml_backend_t backend = bi >= 0 ? ggml_backend_sched_get_backend(lctx.sched, bi) : nullptr;
+        if (backend && ggml_backend_is_cuda(backend)) {
+            cache->promoter->engine = ggml_backend_cuda_copy_engine_new(backend);
+        }
+        if (!cache->promoter->engine) {
+            LLAMA_LOG_ERROR("expert cache: failed to create the promotion copy engine; promotions disabled\n");
+            return;
+        }
+    }
+    if (cache->promoter->engine) {
+        // order the copies after the compute-stream point of the just-
+        // submitted step: it may still be reading the slot being overwritten
+        ggml_backend_cuda_copy_engine_sync_compute(cache->promoter->engine);
+    }
+#endif
+
+    const int32_t old = cl.slot_expert[slot];
+    if (old >= 0) {
+        cl.remap[old] = -1;
+    }
+    cl.slot_expert[slot]  = -1;
+    cl.pending_mask      |= (1ull << slot);
+    cache->promoter->submit(std::move(j));
+
+    static int dbg = -1;
+    if (dbg < 0) {
+        dbg = getenv("IK_EXP_CACHE_DEBUG") ? 1 : 0;
+    }
+    if (dbg) {
+        fprintf(stderr, "EXP_CACHE_PROMOTE queue L%d slot=%d expert=%d (evicted=%d)\n",
+                il, slot, expert, old);
+    }
+}
+
+// -------------------------------------------------------------------------
 // M3a: TG step boundary. Applies the classify-staged routing observations of
 // the just-computed step to the per-layer shadow LRU simulation: hit touches,
 // classic-LRU promotion/eviction, and the rolling miss-count window that the
 // M3c admission filter (promote on 2nd miss within N steps) will consult.
-// Mutates ONLY sim_* fields — the live remap and slot contents stay the
-// static dummy, so this changes no compute behavior. PP is never staged, so
-// PP steps are full no-ops here.
+// The sim mutates ONLY sim_* fields. M3b adds live promotion: publish of
+// completed copies and the IK_EXP_CACHE_FORCE_PROMOTE validation hook — the
+// only writers of the live remap/pending_mask besides the static init. PP is
+// never staged, so PP steps are sim no-ops here (publish still runs).
+
+// M3b: publish promotions whose copies have completed. FIFO: one copy stream
+// completes fences in order, so stop at the first incomplete job.
+// IK_EXP_CACHE_VERIFY_COPIES=1 reads the published slot back and memcmps it
+// against the source expert slices (debug self-check of the copy path).
+static void llama_expert_cache_publish(llama_context & lctx) {
+    auto & cache = lctx.expert_cache;
+    auto & promoter = cache->promoter;
+    if (!promoter) {
+        return;
+    }
+    static int dbg = -1;
+    if (dbg < 0) {
+        dbg = getenv("IK_EXP_CACHE_DEBUG") ? 1 : 0;
+    }
+    static const bool verify = getenv("IK_EXP_CACHE_VERIFY_COPIES") != nullptr;
+    std::lock_guard<std::mutex> lock(promoter->mtx);
+    while (!promoter->pending.empty()) {
+        const auto & f = promoter->pending.front();
+        bool done = f.copy_fence == 0; // host copies complete at issue
+#ifdef GGML_USE_CUDA
+        if (f.copy_fence != 0) {
+            done = ggml_backend_cuda_copy_engine_poll(promoter->engine, f.copy_fence);
+        }
+#endif
+        if (!done) {
+            break;
+        }
+        auto & cl = cache->layers[f.il];
+        cl.remap[f.expert]       = f.slot;
+        cl.slot_expert[f.slot]   = f.expert;
+        cl.pending_mask         &= ~(1ull << f.slot);
+        promoter->pending.pop_front();
+        if (dbg) {
+            fprintf(stderr, "EXP_CACHE_PROMOTE publish L%d slot=%d expert=%d step=%llu\n",
+                    f.il, f.slot, f.expert, (unsigned long long) cache->step);
+        }
+        if (verify) {
+            const auto & layer = lctx.model.layers[f.il];
+            const ggml_tensor * srcs[3] = { layer.ffn_up_exps,     layer.ffn_gate_exps,     layer.ffn_down_exps     };
+            const ggml_tensor * dsts[3] = { layer.ffn_up_exps_hot, layer.ffn_gate_exps_hot, layer.ffn_down_exps_hot };
+            bool ok = true;
+            for (int i = 0; i < 3 && ok; i++) {
+                const size_t esize = srcs[i]->nb[2];
+                const char * src = (const char *) srcs[i]->data + (size_t) f.expert * esize;
+                if (ggml_backend_buffer_is_host(dsts[i]->buffer)) {
+                    ok = memcmp((const char *) dsts[i]->data + (size_t) f.slot * esize, src, esize) == 0;
+                } else {
+                    std::vector<char> buf(esize);
+                    ggml_backend_tensor_get(dsts[i], buf.data(), (size_t) f.slot * esize, esize);
+                    ok = memcmp(buf.data(), src, esize) == 0;
+                }
+            }
+            fprintf(stderr, "EXP_CACHE_VERIFY_COPIES L%d slot=%d expert=%d: %s\n",
+                    f.il, f.slot, f.expert, ok ? "PASS (bitwise)" : "FAIL");
+            if (!ok) {
+                GGML_ABORT("expert cache promotion copy verification failed");
+            }
+        }
+    }
+}
+
+// IK_EXP_CACHE_FORCE_PROMOTE=il:slot:expert:step — M3b validation hook state
+struct exp_cache_force_cfg {
+    int32_t il = -1, slot = -1, expert = -1;
+    int64_t step = -1;
+    bool    done = false;
+};
+
 static void llama_expert_cache_step_boundary(llama_context & lctx) {
     auto & cache = lctx.expert_cache;
-    if (!cache || cache->staged_layers.empty()) {
+    if (!cache) {
+        return;
+    }
+    // M3b: promotions publish even on steps that staged nothing
+    llama_expert_cache_publish(lctx);
+    if (cache->staged_layers.empty()) {
         return;
     }
     static const int32_t window = [] {
@@ -7053,6 +7319,53 @@ static void llama_expert_cache_step_boundary(llama_context & lctx) {
         }
     }
     cache->staged_layers.clear();
+
+    // M3b validation hook: one forced promotion at a chosen step.
+    // IK_EXP_CACHE_FORCE_PROMOTE=il:slot:expert:step; expert -1 self-selects
+    // the first staged miss of that layer at this step (live remap).
+    static exp_cache_force_cfg force = [] {
+        exp_cache_force_cfg c;
+        const char * e = getenv("IK_EXP_CACHE_FORCE_PROMOTE");
+        if (e && *e) {
+            long long step = -1;
+            if (sscanf(e, "%d:%d:%d:%lld", &c.il, &c.slot, &c.expert, &step) == 4) {
+                c.step = step;
+            } else {
+                LLAMA_LOG_WARN("expert cache: malformed IK_EXP_CACHE_FORCE_PROMOTE '%s' (want il:slot:expert:step)\n", e);
+            }
+        }
+        return c;
+    }();
+    if (!force.done && force.step >= 0 && (int64_t) cache->step == force.step) {
+        force.done = true;
+        auto it = cache->layers.find(force.il);
+        if (it == cache->layers.end()) {
+            LLAMA_LOG_WARN("expert cache: forced promotion skipped — layer %d is not cached\n", force.il);
+        } else {
+            auto & cl = it->second;
+            const int32_t n_expert = (int32_t) cl.remap.size();
+            int32_t expert = force.expert;
+            if (expert < 0) {
+                for (size_t i = 0; i < cl.sim_staged_ids.size() && expert < 0; i++) {
+                    const int32_t id = cl.sim_staged_ids[i];
+                    if (id >= 0 && id < n_expert && cl.remap[id] < 0) {
+                        expert = id;
+                    }
+                }
+            }
+            if (expert < 0 || expert >= n_expert) {
+                LLAMA_LOG_WARN("expert cache: forced promotion skipped — no eligible expert on L%d\n", force.il);
+            } else if (cl.remap[expert] >= 0) {
+                LLAMA_LOG_WARN("expert cache: forced promotion skipped — expert %d already resident on L%d\n", expert, force.il);
+            } else if (force.slot < 0 || force.slot > cache->h) {
+                LLAMA_LOG_WARN("expert cache: forced promotion skipped — slot %d out of range [0, %d]\n", force.slot, cache->h);
+            } else if (cl.pending_mask != 0) {
+                LLAMA_LOG_WARN("expert cache: forced promotion skipped — L%d has a pending slot\n", force.il);
+            } else {
+                llama_expert_cache_queue_promotion(lctx, force.il, force.slot, expert);
+            }
+        }
+    }
     cache->step++;
 
     static int dbg = -1;
